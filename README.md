@@ -15,11 +15,25 @@
 
 ## 快速开始
 
-### 方式一：npx 直接用
+### 方式一：npx 直接用（推荐，无需安装）
 
 ```bash
 npx navidog
 ```
+
+运行后终端会显示：
+
+```
+  🐕 NaviDog starting on http://127.0.0.1:3001
+
+NaviDog listening on http://127.0.0.1:3001
+```
+
+1. 打开浏览器访问 **http://127.0.0.1:3001**
+2. 点击工具栏「连接」创建 MySQL 连接
+3. 用完后在终端按 `Ctrl + C` 停止服务
+
+自定义端口：`PORT=8080 npx navidog`
 
 ### 方式二：全局安装
 
@@ -27,6 +41,8 @@ npx navidog
 npm install -g navidog
 navidog
 ```
+
+以后随时在终端输入 `navidog` 即可启动，`Ctrl + C` 停止。
 
 ### 方式三：克隆源码
 
@@ -38,7 +54,7 @@ npm run build
 npm start
 ```
 
-启动后打开 http://127.0.0.1:3001 即可使用。
+启动后打开 **http://127.0.0.1:3001** 即可使用。
 
 ### 开发模式
 
