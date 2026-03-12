@@ -1,5 +1,6 @@
 import type {
   ConnectionProfile,
+  ImportCreateTablePlan,
   QueryExecutionResponse,
   SchemaTreeResponse,
   TableColumnsResponse,
@@ -44,5 +45,31 @@ export const api = {
   },
   runQuery(connection: ConnectionProfile, sql: string, database?: string) {
     return request<QueryExecutionResponse>('/query', { connection, sql, database })
+  },
+  importBatch(
+    connection: ConnectionProfile,
+    database: string,
+    table: string,
+    mode: 'append' | 'replace' | 'upsert',
+    primaryKeys: string[],
+    columns: { source: string; target: string }[],
+    rows: Record<string, unknown>[],
+    createTable?: ImportCreateTablePlan | null,
+  ) {
+    return request<{
+      processed: number
+      inserted: number
+      updated: number
+      errors: string[]
+    }>('/import/batch', {
+      connection,
+      database,
+      table,
+      mode,
+      primaryKeys,
+      columns,
+      rows,
+      createTable,
+    })
   },
 }

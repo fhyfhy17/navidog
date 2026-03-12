@@ -1,6 +1,8 @@
 import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import SqlEditor from './components/SqlEditor'
+import ImportWizard from './components/ImportWizard'
+import ExportWizard from './components/ExportWizard'
 import type {
   AppTab,
   ConnectionProfile,
@@ -442,6 +444,28 @@ export default function App() {
     ])
   }
 
+  /* ── Import Wizard state ──────────────────── */
+  const [importWizard, setImportWizard] = useState<{
+    connectionId: string;
+    schemaName?: string;
+    tableName?: string;
+  } | null>(null)
+
+  function openImportWizard(connectionId: string, schemaName?: string, tableName?: string) {
+    setImportWizard({ connectionId, schemaName, tableName })
+  }
+
+  /* ── Export Wizard state ──────────────────── */
+  const [exportWizard, setExportWizard] = useState<{
+    connectionId: string;
+    schemaName?: string;
+    tableName?: string;
+  } | null>(null)
+
+  function openExportWizard(connectionId: string, schemaName?: string, tableName?: string) {
+    setExportWizard({ connectionId, schemaName, tableName })
+  }
+
   function dbContextMenu(e: React.MouseEvent, connectionId: string, schemaName: string) {
     showContextMenu(e, [
       { icon: '📂', label: '打开数据库', action: () => { closeContextMenu(); openObjectsTab(connectionId, schemaName) } },
@@ -466,6 +490,15 @@ export default function App() {
           }
         }
         input.click()
+      } },
+      'separator',
+      { icon: '📥', label: '导入向导...', action: () => {
+        closeContextMenu()
+        openImportWizard(connectionId, schemaName)
+      } },
+      { icon: '📤', label: '导出向导...', action: () => {
+        closeContextMenu()
+        openExportWizard(connectionId, schemaName)
       } },
       'separator',
       { icon: '📥', label: '转储结构...', action: () => {
@@ -755,6 +788,15 @@ export default function App() {
         { icon: '📦', label: '结构和数据...', action: () => { closeContextMenu(); void dumpTable(connectionId, schemaName, tableName, 'both') } },
         { icon: '📐', label: '仅结构...', action: () => { closeContextMenu(); void dumpTable(connectionId, schemaName, tableName, 'structure') } },
       ] },
+      'separator',
+      { icon: '📥', label: '导入数据...', action: () => {
+        closeContextMenu()
+        openImportWizard(connectionId, schemaName, tableName)
+      } },
+      { icon: '📤', label: '导出数据...', action: () => {
+        closeContextMenu()
+        openExportWizard(connectionId, schemaName, tableName)
+      } },
     ])
   }
 
@@ -3091,6 +3133,38 @@ export default function App() {
         style={{ display: 'none' }}
         onChange={handleImportNcxFile}
       />
+
+      {/* ── Import Wizard ─────────────────────────── */}
+      {importWizard && (() => {
+        const conn = liveConnections.get(importWizard.connectionId)
+        if (!conn) return null
+        return (
+          <ImportWizard
+            connection={conn.profile}
+            schemas={conn.schemas}
+            initialSchema={importWizard.schemaName}
+            initialTable={importWizard.tableName}
+            onClose={() => setImportWizard(null)}
+            onFlash={flash}
+          />
+        )
+      })()}
+
+      {/* ── Export Wizard ─────────────────────────── */}
+      {exportWizard && (() => {
+        const conn = liveConnections.get(exportWizard.connectionId)
+        if (!conn) return null
+        return (
+          <ExportWizard
+            connection={conn.profile}
+            schemas={conn.schemas}
+            initialSchema={exportWizard.schemaName}
+            initialTable={exportWizard.tableName}
+            onClose={() => setExportWizard(null)}
+            onFlash={flash}
+          />
+        )
+      })()}
 
       {/* ── Notice toast ─────────────────────────── */}
       {notice && (

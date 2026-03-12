@@ -11,12 +11,13 @@ import {
   normalizeConnectionPayload,
   testConnection,
 } from './mysql.js'
+import { importBatch } from './import.js'
 
 const app = express()
 const host = '127.0.0.1'
 const port = Number.parseInt(process.env.PORT ?? '3001', 10)
 
-app.use(express.json({ limit: '1mb' }))
+app.use(express.json({ limit: '50mb' }))
 
 app.get('/api/health', (_request, response) => {
   response.json({ ok: true })
@@ -93,6 +94,29 @@ app.post('/api/query', async (request, response) => {
     console.error('[/api/query] ERROR')
     response.status(400).json({
       error: error instanceof Error ? error.message : 'SQL execution failed.',
+    })
+  }
+})
+
+/* ── Data Import ────────────────────────────── */
+app.post('/api/import/batch', async (request, response) => {
+  try {
+    const connection = normalizeConnectionPayload(request.body.connection)
+    const { database, table, mode, primaryKeys, columns, rows, createTable } = request.body
+    const result = await importBatch(connection, {
+      database: String(database ?? ''),
+      table: String(table ?? ''),
+      mode: mode ?? 'append',
+      primaryKeys: primaryKeys ?? [],
+      columns: columns ?? [],
+      rows: rows ?? [],
+      createTable: createTable ?? undefined,
+    })
+    response.json(result)
+  } catch (error) {
+    console.error('[/api/import/batch] ERROR:', error)
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'Import failed.',
     })
   }
 })

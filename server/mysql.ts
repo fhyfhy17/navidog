@@ -120,6 +120,10 @@ function readBoolean(value: unknown, fallback: boolean) {
   return fallback
 }
 
+function q(identifier: string) {
+  return `\`${identifier.replaceAll('`', '``')}\``
+}
+
 export function normalizeConnectionPayload(payload: unknown): ConnectionConfig {
   if (!payload || typeof payload !== 'object') {
     throw new Error('Connection payload is missing.')
@@ -595,24 +599,14 @@ export async function fetchTableColumns(
     withReconnect(effectiveConfig, async () => {
       const pool = await getPool(effectiveConfig)
       const [columnRows] = await pool.query<RowDataPacket[]>(
-        `
-          SELECT
-            COLUMN_NAME AS columnName,
-            COLUMN_TYPE AS columnType,
-            IS_NULLABLE AS isNullable,
-            COLUMN_KEY AS columnKey
-          FROM INFORMATION_SCHEMA.COLUMNS
-          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-          ORDER BY ORDINAL_POSITION
-        `,
-        [schemaName, tableName],
+        `SHOW FULL COLUMNS FROM ${q(schemaName)}.${q(tableName)}`,
       )
 
       return columnRows.map((row) => ({
-        name: String(row.columnName),
-        type: String(row.columnType),
-        nullable: String(row.isNullable).toUpperCase() === 'YES',
-        key: String(row.columnKey ?? ''),
+        name: String(row.Field ?? ''),
+        type: String(row.Type ?? ''),
+        nullable: String(row.Null ?? '').toUpperCase() === 'YES',
+        key: String(row.Key ?? ''),
       }))
     }),
   )

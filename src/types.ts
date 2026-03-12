@@ -41,6 +41,11 @@ export type TableColumn = {
   key: string
 }
 
+export type ImportCreateTablePlan = {
+  columns: TableColumn[]
+  primaryKeys: string[]
+}
+
 /* ── Query results ──────────────────────────── */
 
 export type RowResultSet = {
