@@ -219,6 +219,12 @@ export default function App() {
   } | null>(null)
   const pickerInputRef = useRef<HTMLInputElement>(null)
 
+  /* ── CLI state ─────────────────────────────── */
+  const cliInputRef = useRef<HTMLInputElement>(null)
+  const cliScrollRef = useRef<HTMLDivElement>(null)
+  const [cliInput, setCliInput] = useState('')
+  const [cliHistoryIdx, setCliHistoryIdx] = useState(-1)
+
   /* ── Modal state ────────────────────────────── */
   const [showModal, setShowModal] = useState(false)
   const [draft, setDraft] = useState<ConnectionDraft>(blankDraft)
@@ -2548,11 +2554,7 @@ export default function App() {
     const conn = liveConnections.get(tab.connectionId)
     if (!conn) return <div className="empty-state"><span className="empty-title">未连接</span></div>
 
-    const cliInputRef = useRef<HTMLInputElement>(null)
-    const cliScrollRef = useRef<HTMLDivElement>(null)
-    const [cliInput, setCliInput] = useState('')
-    const [cliHistoryIdx, setCliHistoryIdx] = useState(-1)
-    const inputHistory = useMemo(() => tab.history.map(h => h.input).filter(Boolean), [tab.history])
+    const inputHistory = tab.history.map(h => h.input).filter(Boolean)
 
     function scrollToBottom() {
       setTimeout(() => {
@@ -2566,10 +2568,14 @@ export default function App() {
       if (!sql.trim()) return
       updateTab<CliTab>(tab.id, { loading: true })
 
+      // Detect USE xxx command
+      const useMatch = sql.trim().match(/^use\s+[`]?(\w+)[`]?\s*;?\s*$/i)
+      const effectiveSchema = useMatch ? useMatch[1] : tab.schemaName
+
       let output = ''
       let isError = false
       try {
-        const resp = await api.runQuery(conn!.profile, sql, tab.schemaName)
+        const resp = await api.runQuery(conn!.profile, sql, effectiveSchema)
         const result = resp.results[0]
         if (!result) {
           output = 'OK'
@@ -2602,6 +2608,11 @@ export default function App() {
         } else if (result.kind === 'message') {
           output = result.message
         }
+
+        // If USE succeeded, switch the CLI's active database
+        if (useMatch && !isError) {
+          output = `Database changed to ${effectiveSchema}`
+        }
       } catch (err) {
         output = `ERROR: ${err instanceof Error ? err.message : String(err)}`
         isError = true
@@ -2610,10 +2621,13 @@ export default function App() {
       updateTab<CliTab>(tab.id, {
         history: [...tab.history, { input: sql, output, isError }],
         loading: false,
+        ...(useMatch && !isError ? { schemaName: effectiveSchema } : {}),
       })
       setCliInput('')
       setCliHistoryIdx(-1)
       scrollToBottom()
+      // Re-focus input after execution
+      setTimeout(() => cliInputRef.current?.focus(), 60)
     }
 
     function handleCliKeyDown(e: React.KeyboardEvent) {
@@ -2645,7 +2659,7 @@ export default function App() {
     }
 
     return (
-      <div className="cli-container" onClick={() => cliInputRef.current?.focus()}>
+      <div className="cli-container">
         <div className="cli-output" ref={cliScrollRef}>
           <div className="cli-welcome">
             MySQL [{conn.profile.label}] — {tab.schemaName}
@@ -2659,7 +2673,7 @@ export default function App() {
               <pre className={`cli-result${entry.isError ? ' cli-error' : ''}`}>{entry.output}</pre>
             </div>
           ))}
-          <div className="cli-input-line">
+          <div className="cli-input-line" onClick={() => cliInputRef.current?.focus()}>
             <span className="cli-prompt">mysql&gt; </span>
             <input
               ref={cliInputRef}

@@ -1864,7 +1864,7 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: #1e1e2e;
+  background: #fafbfc;
   cursor: text;
 }
 
@@ -1875,13 +1875,13 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   font-family: 'SF Mono', 'Monaco', 'Menlo', 'Consolas', monospace;
   font-size: 13px;
   line-height: 1.5;
-  color: #cdd6f4;
+  color: #333;
 }
 
 .cli-welcome {
-  color: #a6adc8;
+  color: #888;
   padding-bottom: 8px;
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid #e0e0e0;
   margin-bottom: 8px;
   font-size: 12px;
 }
@@ -1896,14 +1896,14 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 }
 
 .cli-prompt {
-  color: #a6e3a1;
+  color: #2e7d32;
   font-weight: 600;
   flex-shrink: 0;
   user-select: none;
 }
 
 .cli-cmd {
-  color: #89dceb;
+  color: #1565c0;
 }
 
 .cli-result {
@@ -1911,12 +1911,12 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   white-space: pre;
   font-family: inherit;
   font-size: 12px;
-  color: #bac2de;
+  color: #444;
   overflow-x: auto;
 }
 
 .cli-result.cli-error {
-  color: #f38ba8;
+  color: #c62828;
 }
 
 .cli-input-line {
@@ -1930,14 +1930,14 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   background: transparent;
   border: none;
   outline: none;
-  color: #89dceb;
+  color: #1565c0;
   font-family: inherit;
   font-size: 13px;
-  caret-color: #f5e0dc;
+  caret-color: #333;
 }
 
 .cli-input::placeholder {
-  color: #585b70;
+  color: #aaa;
 }
 
 .cli-input:disabled {
