@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const serverPath = path.resolve(__dirname, '..', 'server', 'index.ts')
 const port = process.env.PORT || '3001'
 
-console.log(`\n  🐕 NaviDog starting on http://localhost:${port}\n`)
+console.log(`\n  🐕 NaviDog starting on http://127.0.0.1:${port}\n`)
 
 const child = spawn(
   process.execPath,
