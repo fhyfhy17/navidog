@@ -1,0 +1,62 @@
+{
+  "name": "navidog",
+  "version": "1.0.0",
+  "description": "🐕 轻量级 Web 端 MySQL 管理工具，风格类似 Navicat",
+  "type": "module",
+  "bin": {
+    "navidog": "bin/navidog.mjs"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "server/",
+    "src/",
+    "package.json",
+    "README.md",
+    "tsconfig.json",
+    "tsconfig.app.json",
+    "tsconfig.node.json",
+    "vite.config.ts",
+    "index.html"
+  ],
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:web": "vite",
+    "build": "tsc -b && vite build",
+    "start": "node --import tsx server/index.ts",
+    "prepublishOnly": "npm run build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "keywords": ["mysql", "database", "gui", "navicat", "admin", "web"],
+  "license": "MIT",
+  "dependencies": {
+    "@codemirror/lang-sql": "^6.10.0",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "codemirror": "^6.0.2",
+    "express": "^5.1.0",
+    "mysql2": "^3.15.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "ssh2": "^1.17.0",
+    "tsx": "^4.20.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@types/ssh2": "^1.15.5",
+    "@vitejs/plugin-react": "^5.1.1",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.48.0",
+    "vite": "^7.3.1"
+  }
+}
