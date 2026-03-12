@@ -134,7 +134,17 @@ export type QueryTab = {
   loading: boolean
 }
 
-export type AppTab = ObjectsTab | DataTab | QueryTab
+export type CliTab = {
+  id: string
+  kind: 'cli'
+  title: string
+  connectionId: string
+  schemaName: string
+  history: { input: string; output: string; isError?: boolean }[]
+  loading: boolean
+}
+
+export type AppTab = ObjectsTab | DataTab | QueryTab | CliTab
 
 /* ── Tree selection ─────────────────────────── */
 

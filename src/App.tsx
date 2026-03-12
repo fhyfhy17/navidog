@@ -5,6 +5,7 @@ import ImportWizard from './components/ImportWizard'
 import ExportWizard from './components/ExportWizard'
 import type {
   AppTab,
+  CliTab,
   ConnectionProfile,
   DataTab,
   QueryTab,
@@ -439,6 +440,14 @@ export default function App() {
           if (schemaName) openQueryTab(profile.id, schemaName)
         }
       }, disabled: !isLive },
+      { icon: '💻', label: '命令列界面', action: () => {
+        closeContextMenu()
+        if (isLive) {
+          const conn = liveConnections.get(profile.id)!
+          const schemaName = conn.schemas[0]?.name ?? ''
+          if (schemaName) openCliTab(profile.id, schemaName)
+        }
+      }, disabled: !isLive },
       'separator',
       { icon: '🔄', label: '刷新', shortcut: '⌘R', action: () => { closeContextMenu(); if (isLive) void handleConnect(profile) } },
     ])
@@ -471,6 +480,7 @@ export default function App() {
       { icon: '📂', label: '打开数据库', action: () => { closeContextMenu(); openObjectsTab(connectionId, schemaName) } },
       'separator',
       { icon: '📝', label: '新建查询', shortcut: '⌘Y', action: () => { closeContextMenu(); openQueryTab(connectionId, schemaName) } },
+      { icon: '💻', label: '命令列界面', action: () => { closeContextMenu(); openCliTab(connectionId, schemaName) } },
       { icon: '📄', label: '运行 SQL 文件...', action: () => {
         closeContextMenu()
         const conn = liveConnections.get(connectionId)
@@ -1073,6 +1083,22 @@ export default function App() {
       results: [],
       activeResultIndex: 0,
       durationMs: 0,
+      loading: false,
+    }
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
+  }
+
+  function openCliTab(connectionId: string, schemaName: string) {
+    const conn = liveConnections.get(connectionId)
+    const label = conn?.profile.label ?? ''
+    const tab: CliTab = {
+      id: crypto.randomUUID(),
+      kind: 'cli',
+      title: `命令列界面 - ${label}`,
+      connectionId,
+      schemaName,
+      history: [],
       loading: false,
     }
     setTabs(prev => [...prev, tab])
@@ -2517,6 +2543,141 @@ export default function App() {
     )
   }
 
+  /* ── CLI tab content ──────────────────────────── */
+  function renderCliTab(tab: CliTab) {
+    const conn = liveConnections.get(tab.connectionId)
+    if (!conn) return <div className="empty-state"><span className="empty-title">未连接</span></div>
+
+    const cliInputRef = useRef<HTMLInputElement>(null)
+    const cliScrollRef = useRef<HTMLDivElement>(null)
+    const [cliInput, setCliInput] = useState('')
+    const [cliHistoryIdx, setCliHistoryIdx] = useState(-1)
+    const inputHistory = useMemo(() => tab.history.map(h => h.input).filter(Boolean), [tab.history])
+
+    function scrollToBottom() {
+      setTimeout(() => {
+        if (cliScrollRef.current) {
+          cliScrollRef.current.scrollTop = cliScrollRef.current.scrollHeight
+        }
+      }, 50)
+    }
+
+    async function executeCli(sql: string) {
+      if (!sql.trim()) return
+      updateTab<CliTab>(tab.id, { loading: true })
+
+      let output = ''
+      let isError = false
+      try {
+        const resp = await api.runQuery(conn!.profile, sql, tab.schemaName)
+        const result = resp.results[0]
+        if (!result) {
+          output = 'OK'
+        } else if (result.kind === 'rows') {
+          if (result.rows.length === 0) {
+            output = 'Empty set'
+          } else {
+            // Format as ASCII table
+            const cols = result.columns
+            const widths = cols.map(c => c.length)
+            const strRows = result.rows.map(row =>
+              cols.map((c, i) => {
+                const v = row[c] === null || row[c] === undefined ? 'NULL' : String(row[c])
+                widths[i] = Math.max(widths[i], v.length)
+                return v
+              })
+            )
+            const sep = '+' + widths.map(w => '-'.repeat(w + 2)).join('+') + '+'
+            const hdr = '|' + cols.map((c, i) => ` ${c.padEnd(widths[i])} `).join('|') + '|'
+            const dataLines = strRows.map(r =>
+              '|' + r.map((v, i) => ` ${v.padEnd(widths[i])} `).join('|') + '|'
+            )
+            const lines = [sep, hdr, sep, ...dataLines, sep]
+            lines.push(`${result.rows.length} row${result.rows.length > 1 ? 's' : ''} in set`)
+            output = lines.join('\n')
+          }
+        } else if (result.kind === 'mutation') {
+          output = `Query OK, ${result.affectedRows} row${result.affectedRows !== 1 ? 's' : ''} affected`
+          if (result.info) output += `\n${result.info}`
+        } else if (result.kind === 'message') {
+          output = result.message
+        }
+      } catch (err) {
+        output = `ERROR: ${err instanceof Error ? err.message : String(err)}`
+        isError = true
+      }
+
+      updateTab<CliTab>(tab.id, {
+        history: [...tab.history, { input: sql, output, isError }],
+        loading: false,
+      })
+      setCliInput('')
+      setCliHistoryIdx(-1)
+      scrollToBottom()
+    }
+
+    function handleCliKeyDown(e: React.KeyboardEvent) {
+      if (e.key === 'Enter' && !tab.loading) {
+        e.preventDefault()
+        void executeCli(cliInput)
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        const newIdx = cliHistoryIdx === -1 ? inputHistory.length - 1 : Math.max(0, cliHistoryIdx - 1)
+        if (newIdx >= 0 && newIdx < inputHistory.length) {
+          setCliHistoryIdx(newIdx)
+          setCliInput(inputHistory[newIdx])
+        }
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        if (cliHistoryIdx === -1) return
+        const newIdx = cliHistoryIdx + 1
+        if (newIdx >= inputHistory.length) {
+          setCliHistoryIdx(-1)
+          setCliInput('')
+        } else {
+          setCliHistoryIdx(newIdx)
+          setCliInput(inputHistory[newIdx])
+        }
+      } else if (e.key === 'l' && e.ctrlKey) {
+        e.preventDefault()
+        updateTab<CliTab>(tab.id, { history: [] })
+      }
+    }
+
+    return (
+      <div className="cli-container" onClick={() => cliInputRef.current?.focus()}>
+        <div className="cli-output" ref={cliScrollRef}>
+          <div className="cli-welcome">
+            MySQL [{conn.profile.label}] — {tab.schemaName}
+          </div>
+          {tab.history.map((entry, i) => (
+            <div key={i} className="cli-entry">
+              <div className="cli-prompt-line">
+                <span className="cli-prompt">mysql&gt; </span>
+                <span className="cli-cmd">{entry.input}</span>
+              </div>
+              <pre className={`cli-result${entry.isError ? ' cli-error' : ''}`}>{entry.output}</pre>
+            </div>
+          ))}
+          <div className="cli-input-line">
+            <span className="cli-prompt">mysql&gt; </span>
+            <input
+              ref={cliInputRef}
+              className="cli-input"
+              value={cliInput}
+              onChange={e => setCliInput(e.target.value)}
+              onKeyDown={handleCliKeyDown}
+              placeholder={tab.loading ? '执行中...' : '输入 SQL 命令...'}
+              disabled={tab.loading}
+              autoFocus
+              spellCheck={false}
+            />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   /* ── Tab content router ─────────────────────── */
   function renderTabContent() {
     if (!activeTab) {
@@ -2531,6 +2692,7 @@ export default function App() {
     if (activeTab.kind === 'objects') return renderObjectsTab(activeTab as AppTab & { kind: 'objects' })
     if (activeTab.kind === 'data') return renderDataTab(activeTab as DataTab)
     if (activeTab.kind === 'query') return renderQueryTab(activeTab as QueryTab)
+    if (activeTab.kind === 'cli') return renderCliTab(activeTab as CliTab)
     return null
   }
 
@@ -3016,7 +3178,7 @@ export default function App() {
                 }}
               >
                 <span className="tab-icon">
-                  {tab.kind === 'objects' ? '📋' : tab.kind === 'data' ? '📊' : '📝'}
+                  {tab.kind === 'objects' ? '📋' : tab.kind === 'data' ? '📊' : tab.kind === 'cli' ? '💻' : '📝'}
                 </span>
                 <span className="tab-title">{tab.title}</span>
                 <button className="tab-close" onClick={e => { e.stopPropagation(); closeTab(tab.id) }}>✕</button>
