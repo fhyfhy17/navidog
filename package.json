@@ -1,6 +1,6 @@
 {
   "name": "navidog",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "🐕 轻量级 Web 端 MySQL 管理工具，风格类似 Navicat",
   "repository": {
     "type": "git",
