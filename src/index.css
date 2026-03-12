@@ -661,7 +661,14 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 
 .navi-filter-op {
   color: #333;
-  padding: 0 4px;
+  padding: 1px 2px;
+  border: 1px solid #d0d0d0;
+  border-radius: 3px;
+  background: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  min-width: 50px;
+  outline: none;
 }
 
 .navi-filter-val {

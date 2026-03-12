@@ -979,7 +979,7 @@ export default function App() {
     fetchDdl(conn.profile, schemaName, tableName)
   }
 
-  async function loadDataPage(tabId: string, profile: ConnectionProfile, schemaName: string, tableName: string, page: number, whereOverride?: string) {
+  async function loadDataPage(tabId: string, profile: ConnectionProfile, schemaName: string, tableName: string, page: number, whereOverride?: string, orderOverride?: { col: string; dir: 'ASC' | 'DESC' } | null) {
     updateTab(tabId, { loading: true })
     try {
       // Build WHERE clause — use override if provided (avoids stale closure state)
@@ -995,9 +995,10 @@ export default function App() {
         totalRows = Number(countResult.rows[0].cnt ?? 0)
       }
 
-      // Fetch page data
+      // Fetch page data — use override if provided (avoids stale closure)
+      const effectiveOrder = orderOverride !== undefined ? orderOverride : orderBy
       const offset = (page - 1) * PAGE_SIZE
-      const orderClause = orderBy ? ` ORDER BY \`${orderBy.col}\` ${orderBy.dir}` : ''
+      const orderClause = effectiveOrder ? ` ORDER BY \`${effectiveOrder.col}\` ${effectiveOrder.dir}` : ''
       const dataSql = `SELECT * FROM ${q(schemaName)}.${q(tableName)}${whereClause}${orderClause} LIMIT ${PAGE_SIZE} OFFSET ${offset};`
       const dataResp = await api.runQuery(profile, dataSql, schemaName)
       const dataResult = dataResp.results[0]
@@ -1353,6 +1354,7 @@ export default function App() {
                 <tr
                   key={table.name}
                   onDoubleClick={() => void openDataTab(tab.connectionId, tab.schemaName, table.name)}
+                  onContextMenu={e => tableContextMenu(e, tab.connectionId, tab.schemaName, table.name)}
                   style={{ cursor: 'pointer' }}
                 >
                   <td>
@@ -1414,11 +1416,11 @@ export default function App() {
     const totalPages = Math.max(1, Math.ceil(tab.totalRows / PAGE_SIZE))
     const rowOffset = (tab.page - 1) * PAGE_SIZE
 
-    function goToPage(page: number, whereOverride?: string) {
+    function goToPage(page: number, whereOverride?: string, orderOverride?: { col: string; dir: 'ASC' | 'DESC' } | null) {
       const conn = liveConnections.get(tab.connectionId)
       if (!conn) return
       setSelectedRows(new Set())
-      void loadDataPage(tab.id, conn.profile, tab.schemaName, tab.tableName, page, whereOverride)
+      void loadDataPage(tab.id, conn.profile, tab.schemaName, tab.tableName, page, whereOverride, orderOverride)
     }
 
     /** Escape SQL value */
@@ -1681,14 +1683,11 @@ export default function App() {
 
     /** Apply sort on column */
     function applySort(col: string, dir: 'ASC' | 'DESC' | null) {
-      if (dir === null) {
-        setOrderBy(null)
-      } else {
-        setOrderBy({ col, dir })
-      }
+      const newOrder = dir ? { col, dir } : null
+      setOrderBy(newOrder)
       setColSortMenu(null)
-      // Re-fetch with new sort, keeping current data until complete
-      setTimeout(() => goToPage(1), 0)
+      // Pass new sort directly to avoid stale closure
+      goToPage(1, undefined, newOrder)
     }
 
     /** Sort indicator for column header */
@@ -1774,6 +1773,26 @@ export default function App() {
     }
 
     /** Build WHERE from filter rules */
+    const FILTER_OPS: { value: string; label: string; noValue?: boolean }[] = [
+      { value: '=', label: '=' },
+      { value: '!=', label: '!=' },
+      { value: '<', label: '<' },
+      { value: '<=', label: '<=' },
+      { value: '>', label: '>' },
+      { value: '>=', label: '>=' },
+      { value: 'LIKE', label: '包含' },
+      { value: 'NOT LIKE', label: '不包含' },
+      { value: 'STARTS', label: '开始以' },
+      { value: 'NOT STARTS', label: '不是开始于' },
+      { value: 'ENDS', label: '结束以' },
+      { value: 'NOT ENDS', label: '不是结束于' },
+      { value: 'IS NULL', label: '是 null', noValue: true },
+      { value: 'IS NOT NULL', label: '不是 null', noValue: true },
+      { value: 'EMPTY', label: '是空的', noValue: true },
+      { value: 'NOT EMPTY', label: '不是空的', noValue: true },
+    ]
+    const noValueOps = new Set(FILTER_OPS.filter(o => o.noValue).map(o => o.value))
+
     function buildWhereFromRules(rules: typeof filterRules): string {
       const parts: string[] = []
       for (const r of rules) {
@@ -1781,24 +1800,64 @@ export default function App() {
         if (r.isGroup && r.children && r.children.length > 0) {
           const inner = buildWhereFromRules(r.children)
           if (inner) parts.push(`(${inner})`)
-        } else if (!r.isGroup && r.value !== null) {
+        } else if (!r.isGroup) {
+          const col = `\`${r.col}\``
+          // No-value operators
+          if (r.op === 'IS NULL') { parts.push(`${col} IS NULL`); continue }
+          if (r.op === 'IS NOT NULL') { parts.push(`${col} IS NOT NULL`); continue }
+          if (r.op === 'EMPTY') { parts.push(`(${col} IS NULL OR ${col} = '')`); continue }
+          if (r.op === 'NOT EMPTY') { parts.push(`(${col} IS NOT NULL AND ${col} != '')`); continue }
+          // Value-based operators
+          if (r.value === null) continue
           const vals = r.value.split(',').map(v => v.trim()).filter(Boolean)
           if (vals.length === 0) continue
           const escaped = vals.map(v => v === '__NULL__' ? 'NULL' : `'${v.replace(/'/g, "''")}'`)
           const hasNull = vals.includes('__NULL__')
           const nonNull = escaped.filter((_, i) => vals[i] !== '__NULL__')
-          if (r.op === '=') {
-            if (vals.length === 1 && !hasNull) {
-              parts.push(`\`${r.col}\` = ${escaped[0]}`)
-            } else if (hasNull && nonNull.length > 0) {
-              parts.push(`(\`${r.col}\` IN (${nonNull.join(', ')}) OR \`${r.col}\` IS NULL)`)
-            } else if (hasNull) {
-              parts.push(`\`${r.col}\` IS NULL`)
-            } else {
-              parts.push(`\`${r.col}\` IN (${escaped.join(', ')})`)
-            }
-          } else {
-            parts.push(`\`${r.col}\` ${r.op} ${escaped[0]}`)
+          const firstVal = escaped[0]
+          switch (r.op) {
+            case '=':
+              if (vals.length === 1 && !hasNull) {
+                parts.push(`${col} = ${firstVal}`)
+              } else if (hasNull && nonNull.length > 0) {
+                parts.push(`(${col} IN (${nonNull.join(', ')}) OR ${col} IS NULL)`)
+              } else if (hasNull) {
+                parts.push(`${col} IS NULL`)
+              } else {
+                parts.push(`${col} IN (${escaped.join(', ')})`)
+              }
+              break
+            case '!=':
+              if (vals.length === 1 && !hasNull) {
+                parts.push(`${col} != ${firstVal}`)
+              } else if (hasNull && nonNull.length > 0) {
+                parts.push(`(${col} NOT IN (${nonNull.join(', ')}) AND ${col} IS NOT NULL)`)
+              } else if (hasNull) {
+                parts.push(`${col} IS NOT NULL`)
+              } else {
+                parts.push(`${col} NOT IN (${escaped.join(', ')})`)
+              }
+              break
+            case 'LIKE':
+              parts.push(`${col} LIKE '%${vals[0].replace(/'/g, "''")}%'`)
+              break
+            case 'NOT LIKE':
+              parts.push(`${col} NOT LIKE '%${vals[0].replace(/'/g, "''")}%'`)
+              break
+            case 'STARTS':
+              parts.push(`${col} LIKE '${vals[0].replace(/'/g, "''")}%'`)
+              break
+            case 'NOT STARTS':
+              parts.push(`${col} NOT LIKE '${vals[0].replace(/'/g, "''")}%'`)
+              break
+            case 'ENDS':
+              parts.push(`${col} LIKE '%${vals[0].replace(/'/g, "''")}'`)
+              break
+            case 'NOT ENDS':
+              parts.push(`${col} NOT LIKE '%${vals[0].replace(/'/g, "''")}'`)
+              break
+            default:
+              parts.push(`${col} ${r.op} ${firstVal}`)
           }
         }
       }
@@ -1869,10 +1928,25 @@ export default function App() {
           >
             {tab.columns.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
-          <span className="navi-filter-op">=</span>
-          <span className="navi-filter-val" onClick={() => openValuePicker(rule.id, rule.col, groupId)}>
-            {rule.value !== null ? rule.value : '?'}
-          </span>
+          <select className="navi-filter-op" value={rule.op}
+            onChange={e => {
+              const newOp = e.target.value
+              if (groupId) {
+                setFilterRules(prev => prev.map(r => r.id === groupId && r.children
+                  ? { ...r, children: r.children.map(c => c.id === rule.id ? { ...c, op: newOp, value: noValueOps.has(newOp) ? null : c.value } : c) }
+                  : r))
+              } else {
+                setFilterRules(prev => prev.map(r => r.id === rule.id ? { ...r, op: newOp, value: noValueOps.has(newOp) ? null : r.value } : r))
+              }
+            }}
+          >
+            {FILTER_OPS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+          {!noValueOps.has(rule.op) && (
+            <span className="navi-filter-val" onClick={() => openValuePicker(rule.id, rule.col, groupId)}>
+              {rule.value !== null ? rule.value : '?'}
+            </span>
+          )}
           {!isLast && <span className="navi-filter-connector">and</span>}
           {isLast && !groupId && (
             <>
