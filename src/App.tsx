@@ -26,7 +26,7 @@ import type {
 
 const STORAGE_PROFILES = 'navidog.profiles.v1'
 const STORAGE_HISTORY = 'navidog.history.v1'
-const STORAGE_QUERY_SNIPPETS = 'navidog.query-snippets.v1'
+const STORAGE_SEARCH_HISTORY = 'navidog.search-history.v1'
 const STORAGE_QUERY_TABS = 'navidog.query-tabs.v1'
 const STORAGE_ACTIVE_QUERY_TAB = 'navidog.active-query-tab.v1'
 const PAGE_SIZE = 1000
@@ -97,6 +97,20 @@ function buildResultFileName(schemaName: string, resultIndex: number, extension:
   return `${base}-result-${resultIndex + 1}.${extension}`
 }
 
+function normalizeSearchHistoryValue(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+function pushRecentSearch(values: string[], rawValue: string, limit = 5) {
+  const value = rawValue.trim().replace(/\s+/g, ' ')
+  if (!value) return values
+  const normalized = normalizeSearchHistoryValue(value)
+  return [
+    value,
+    ...values.filter((item) => normalizeSearchHistoryValue(item) !== normalized),
+  ].slice(0, limit)
+}
+
 type SavePickerWindow = Window & {
   showSaveFilePicker?: (options: {
     suggestedName: string
@@ -107,14 +121,7 @@ type SavePickerWindow = Window & {
   }) => Promise<FileSystemFileHandle>
 }
 
-type QuerySnippet = {
-  id: string
-  name: string
-  sql: string
-  connectionId?: string
-  schemaName?: string
-  updatedAt: number
-}
+
 
 type PersistedQueryTab = {
   id: string
@@ -217,6 +224,85 @@ function highlightSql(sql: string): string {
   return result
 }
 
+/** Search input with recent history dropdown */
+function SearchWithHistory({ wrapperClassName, className, placeholder, value, onChange, history, onCommit }: {
+  wrapperClassName?: string
+  className: string
+  placeholder: string
+  value: string
+  onChange: (v: string) => void
+  history: string[]
+  onCommit: (v: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const normalizedValue = normalizeSearchHistoryValue(value)
+  const filtered = history.filter((item) => {
+    const normalizedItem = normalizeSearchHistoryValue(item)
+    if (normalizedItem === normalizedValue) return false
+    if (!normalizedValue) return true
+    return normalizedItem.includes(normalizedValue)
+  })
+
+  function commitValue(rawValue: string) {
+    const nextValue = rawValue.trim().replace(/\s+/g, ' ')
+    if (!nextValue) return
+    onCommit(nextValue)
+  }
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
+  return (
+    <div
+      ref={wrapRef}
+      className={['search-with-history-wrap', wrapperClassName].filter(Boolean).join(' ')}
+    >
+      <input
+        className={className}
+        placeholder={placeholder}
+        value={value}
+        onChange={e => {
+          onChange(e.target.value)
+          if (!open && history.length > 0) setOpen(true)
+        }}
+        onFocus={() => filtered.length > 0 && setOpen(true)}
+        onBlur={() => commitValue(value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter' && value.trim()) {
+            commitValue(value)
+            setOpen(false)
+          }
+          if (e.key === 'Escape') setOpen(false)
+        }}
+        style={{ width: '100%' }}
+      />
+      {open && filtered.length > 0 && (
+        <div className="search-history-dropdown">
+          {filtered.map(h => (
+            <div
+              key={h}
+              className="search-history-item"
+              onMouseDown={e => {
+                e.preventDefault()
+                onChange(h)
+                commitValue(h)
+                setOpen(false)
+              }}
+            >
+              <span style={{ opacity: 0.4, marginRight: 6 }}>🕘</span>{h}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 type ConnectionDraft = {
   id?: string
   label: string
@@ -578,13 +664,11 @@ type QueryTabPaneProps = {
   tab: QueryTab
   schemas: SchemaNode[]
   history: string[]
-  querySnippets: QuerySnippet[]
   flash: (tone: 'success' | 'error', message: string) => void
   onPersistSql: (tabId: string, sql: string) => void
   onChangeSchema: (tabId: string, schemaName: string) => void
   onRunQuery: (tabId: string, sql?: string) => void
   onCancelRunningQuery: (tabId: string, activeQueryId?: string) => void
-  onSaveSnippet: (tab: QueryTab, sql: string) => void
   onClearHistory: () => void
   onSetActiveResult: (tabId: string, index: number) => void
 }
@@ -593,13 +677,11 @@ const QueryTabPane = memo(function QueryTabPane({
   tab,
   schemas,
   history,
-  querySnippets,
   flash,
   onPersistSql,
   onChangeSchema,
   onRunQuery,
   onCancelRunningQuery,
-  onSaveSnippet,
   onClearHistory,
   onSetActiveResult,
 }: QueryTabPaneProps) {
@@ -610,12 +692,6 @@ const QueryTabPane = memo(function QueryTabPane({
   const persistSqlRef = useRef(onPersistSql)
   const activeResult = tab.results[tab.activeResultIndex] ?? null
   const activeRowsResult = activeResult?.kind === 'rows' ? activeResult : null
-  const matchingSnippets = querySnippets
-    .filter((snippet) =>
-      (!snippet.connectionId || snippet.connectionId === tab.connectionId) &&
-      (!snippet.schemaName || snippet.schemaName === tab.schemaName),
-    )
-    .sort((a, b) => b.updatedAt - a.updatedAt)
 
   useEffect(() => {
     persistedSqlRef.current = tab.sql
@@ -691,21 +767,24 @@ const QueryTabPane = memo(function QueryTabPane({
   return (
     <div className="query-pane">
       <div className="query-toolbar">
-        <button
-          className="run-btn"
-          disabled={tab.loading}
-          onClick={runActiveSql}
-          title="运行当前语句，或已选中的 SQL"
-        >
-          {tab.loading ? '⏳ 执行中...' : '▶ 运行'}
-        </button>
-        <button
-          className="run-btn"
-          disabled={!tab.loading || !tab.activeQueryId}
-          onClick={() => onCancelRunningQuery(tab.id, tab.activeQueryId)}
-        >
-          ■ 停止
-        </button>
+        {tab.loading ? (
+          <button
+            className="run-btn stop"
+            onClick={() => onCancelRunningQuery(tab.id, tab.activeQueryId)}
+            disabled={!tab.activeQueryId}
+            title="停止执行"
+          >
+            ■ 停止
+          </button>
+        ) : (
+          <button
+            className="run-btn"
+            onClick={runActiveSql}
+            title="运行当前语句，或已选中的 SQL"
+          >
+            ▶ 运行
+          </button>
+        )}
         <div className="query-db-selector">
           <span className="db-selector-icon">📦</span>
           <select
@@ -718,23 +797,7 @@ const QueryTabPane = memo(function QueryTabPane({
             ))}
           </select>
         </div>
-        <select
-          className="query-snippet-select"
-          value=""
-          onChange={e => {
-            const snippet = matchingSnippets.find(item => item.id === e.target.value)
-            if (!snippet) return
-            applyEditorSql(snippet.sql)
-          }}
-          title="加载 SQL 片段"
-        >
-          <option value="">片段</option>
-          {matchingSnippets.map(snippet => (
-            <option key={snippet.id} value={snippet.id}>{snippet.name}</option>
-          ))}
-        </select>
 
-        <button className="action-btn" onClick={() => onSaveSnippet(tab, draftSqlRef.current)} title="保存为 SQL 片段">💾</button>
         <div style={{ position: 'relative' }}>
           <button className="action-btn" onClick={() => setShowHistoryPanel(prev => !prev)} title="执行历史">🕘</button>
           {showHistoryPanel && (
@@ -835,8 +898,7 @@ const QueryTabPane = memo(function QueryTabPane({
 }, (prev, next) => (
   prev.tab === next.tab &&
   prev.schemas === next.schemas &&
-  prev.history === next.history &&
-  prev.querySnippets === next.querySnippets
+  prev.history === next.history
 ))
 
 type DesignTabWrapperProps = {
@@ -948,7 +1010,7 @@ export default function App() {
   /* ── Persisted state ────────────────────────── */
   const [profiles, setProfiles] = useState<ConnectionProfile[]>(() => readStorage(STORAGE_PROFILES, []))
   const [history, setHistory] = useState<string[]>(() => readStorage(STORAGE_HISTORY, []))
-  const [querySnippets, setQuerySnippets] = useState<QuerySnippet[]>(() => readStorage(STORAGE_QUERY_SNIPPETS, []))
+  const [searchHistory, setSearchHistory] = useState<{ tree: string[]; table: string[] }>(() => readStorage(STORAGE_SEARCH_HISTORY, { tree: [], table: [] }))
 
 
   useEffect(() => {
@@ -972,7 +1034,7 @@ export default function App() {
 
   useEffect(() => { writeStorage(STORAGE_PROFILES, profiles) }, [profiles])
   useEffect(() => { writeStorage(STORAGE_HISTORY, history) }, [history])
-  useEffect(() => { writeStorage(STORAGE_QUERY_SNIPPETS, querySnippets) }, [querySnippets])
+  useEffect(() => { writeStorage(STORAGE_SEARCH_HISTORY, searchHistory) }, [searchHistory])
 
 
   /* ── Connection state ───────────────────────── */
@@ -1269,7 +1331,7 @@ export default function App() {
   function connContextMenu(e: React.MouseEvent, profile: ConnectionProfile) {
     const isLive = liveConnections.has(profile.id)
     showContextMenu(e, [
-      { icon: '🔗', label: '打开连接', action: () => { closeContextMenu(); void handleConnect(profile) }, disabled: isLive },
+      { icon: '🔗', label: '打开连接', action: () => { closeContextMenu(); if (isLive) { setExpandedNodes(prev => { const s = new Set(prev); s.add(`conn:${profile.id}`); return s }) } else { void handleConnect(profile) } } },
       { icon: '⛔', label: '断开连接', action: () => { closeContextMenu(); void handleDisconnect(profile.id) }, disabled: !isLive },
       'separator',
       { icon: '✏️', label: '编辑连接...', action: () => { closeContextMenu(); openEditConnectionModal(profile) } },
@@ -2028,29 +2090,7 @@ export default function App() {
     setHistory([])
   }, [])
 
-  const saveSnippet = useCallback((tab: QueryTab, sqlText = tab.sql) => {
-    const sql = sqlText.trim()
-    if (!sql) {
-      flash('error', '没有可保存的 SQL')
-      return
-    }
 
-    const defaultName = tab.title.startsWith('无标题') ? `SQL ${new Date().toLocaleString()}` : tab.title
-    const name = prompt('片段名称', defaultName)?.trim()
-    if (!name) return
-
-    const snippet: QuerySnippet = {
-      id: crypto.randomUUID(),
-      name,
-      sql,
-      connectionId: tab.connectionId,
-      schemaName: tab.schemaName,
-      updatedAt: Date.now(),
-    }
-
-    setQuerySnippets((prev) => [snippet, ...prev.filter((item) => item.name !== name)].slice(0, 100))
-    flash('success', `已保存片段 "${name}"`)
-  }, [flash])
 
   const cancelRunningQuery = useCallback(async (tabId: string, activeQueryId?: string) => {
     if (!activeQueryId) return
@@ -2273,7 +2313,11 @@ export default function App() {
                   toggleNode(connKey)
                 }}
                 onDoubleClick={() => {
-                  void handleConnect(profile)
+                  if (isLive) {
+                    setExpandedNodes(prev => { const s = new Set(prev); s.add(connKey); return s })
+                  } else {
+                    void handleConnect(profile)
+                  }
                 }}
                 onContextMenu={e => connContextMenu(e, profile)}
               >
@@ -2388,12 +2432,15 @@ export default function App() {
             <span className="tb-icon" style={{ fontSize: 16, width: 20, height: 20 }}>📝</span>
           </button>
           <div className="objects-search-wrap" style={{ marginLeft: 'auto' }}>
-            <input
-              className="objects-search"
-              placeholder="🔍 搜索"
-              value={tab.tableFilter}
-              onChange={e => updateTab(tab.id, { tableFilter: e.target.value })}
-            />
+          <SearchWithHistory
+            wrapperClassName="objects-search-wrap"
+            className="objects-search"
+            placeholder="🔍 搜索"
+            value={tab.tableFilter}
+            onChange={v => updateTab(tab.id, { tableFilter: v })}
+            history={searchHistory.table}
+            onCommit={v => setSearchHistory(prev => ({ ...prev, table: pushRecentSearch(prev.table, v) }))}
+          />
           </div>
         </div>
         <div className="objects-grid">
@@ -3329,13 +3376,11 @@ export default function App() {
         tab={tab}
         schemas={schemas}
         history={history}
-        querySnippets={querySnippets}
         flash={flash}
         onPersistSql={persistQuerySql}
         onChangeSchema={changeQuerySchema}
         onRunQuery={runQuery}
         onCancelRunningQuery={cancelRunningQuery}
-        onSaveSnippet={saveSnippet}
         onClearHistory={clearQueryHistory}
         onSetActiveResult={setQueryActiveResult}
       />
@@ -4209,11 +4254,14 @@ export default function App() {
         {/* ── Sidebar ──────────────────────────────── */}
         {showSidebar && <>
         <div className="sidebar">
-          <input
+          <SearchWithHistory
+            wrapperClassName="sidebar-search-wrap"
             className="sidebar-search"
             placeholder="🔍 搜索"
             value={treeFilter}
-            onChange={e => setTreeFilter(e.target.value)}
+            onChange={setTreeFilter}
+            history={searchHistory.tree}
+            onCommit={v => setSearchHistory(prev => ({ ...prev, tree: pushRecentSearch(prev.tree, v) }))}
           />
           <div className="tree-container">
             {profiles.length === 0 ? (
