@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import * as XLSX from 'xlsx'
 import { api } from '../api'
+import {
+  buildBatchSelectQuery,
+  getPrimaryKeyColumns,
+  readPrimaryKeyCursor,
+} from '../sqlPaging'
 import type { ConnectionProfile, SchemaNode, TableColumn } from '../types'
 
 /* ── Types ───────────────────────────────────── */
@@ -19,6 +23,102 @@ type TableExportConfig = {
   name: string
   enabled: boolean
   fileName: string
+}
+
+type SavePickerWindow = Window & {
+  showSaveFilePicker?: (options: {
+    suggestedName: string
+    types: Array<{
+      description: string
+      accept: Record<string, string[]>
+    }>
+  }) => Promise<FileSystemFileHandle>
+}
+
+type TextExportTarget = {
+  kind: 'download' | 'file'
+  write: (chunk: string) => Promise<void>
+  close: () => Promise<Blob | null>
+}
+
+function escapeCsvValue(
+  value: unknown,
+  separator: string,
+  qualifier: string,
+) {
+  if (value === null || value === undefined) return ''
+  const text = String(value)
+
+  if (!qualifier) {
+    return text
+  }
+
+  if (
+    text.includes(separator) ||
+    text.includes(qualifier) ||
+    text.includes('\n') ||
+    text.includes('\r')
+  ) {
+    const escapedQualifier = qualifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return `${qualifier}${text.replace(new RegExp(escapedQualifier, 'g'), qualifier + qualifier)}${qualifier}`
+  }
+
+  return text
+}
+
+function toSqlLiteral(value: unknown) {
+  if (value === null || value === undefined) return 'NULL'
+  if (typeof value === 'number' || typeof value === 'bigint') return String(value)
+  if (typeof value === 'boolean') return value ? '1' : '0'
+
+  return `'${String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')}'`
+}
+
+async function createTextExportTarget(
+  fileName: string,
+  mimeType: string,
+  useFileSystemAccess: boolean,
+): Promise<TextExportTarget> {
+  if (useFileSystemAccess) {
+    const pickerWindow = window as SavePickerWindow
+    const handle = await pickerWindow.showSaveFilePicker?.({
+      suggestedName: fileName,
+      types: [{
+        description: 'Export Files',
+        accept: { [mimeType]: [`.${fileName.split('.').pop() ?? 'txt'}`] },
+      }],
+    })
+
+    if (handle) {
+      const writable = await handle.createWritable()
+      return {
+        kind: 'file',
+        async write(chunk) {
+          await writable.write(chunk)
+        },
+        async close() {
+          await writable.close()
+          return null
+        },
+      }
+    }
+  }
+
+  const parts: BlobPart[] = []
+  return {
+    kind: 'download',
+    async write(chunk) {
+      parts.push(chunk)
+    },
+    async close() {
+      return new Blob(parts, { type: mimeType })
+    },
+  }
 }
 
 type Props = {
@@ -133,6 +233,8 @@ export default function ExportWizard({
     if (step === 2 && activeTable) {
       void loadColumns(activeTable)
     }
+    // `loadColumns` is intentionally not included to avoid reloading on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, activeTable])
 
   /* ── Column toggle ─────────────────────── */
@@ -194,13 +296,20 @@ export default function ExportWizard({
 
     const eol = lineSeparator === 'CRLF' ? '\r\n' : '\n'
     const allFiles: { name: string; blob: Blob }[] = []
+    const useFileSystemAccess =
+      enabledTables.length === 1 &&
+      format !== 'xlsx' &&
+      typeof window !== 'undefined' &&
+      'showSaveFilePicker' in window
     let totalProcessed = 0
+    let completedExports = 0
 
     for (let ti = 0; ti < enabledTables.length; ti++) {
       const tc = enabledTables[ti]
       const cols = resolvedCols[tc.name] ?? []
       const selCols = resolvedSelected[tc.name] ?? new Set()
       const activeCols = cols.filter((c) => selCols.has(c.name))
+      const fileName = tc.fileName.trim() || `${tc.name}.${FORMAT_EXT[format]}`
 
       if (activeCols.length === 0) {
         setExportLog((prev) => [...prev, `⏭️ 跳过 ${tc.name}（无选中列）`])
@@ -210,108 +319,169 @@ export default function ExportWizard({
       setExportLog((prev) => [...prev, `📤 正在导出 ${tc.name}...`])
 
       const BATCH = 5000
-      const MAX_ROWS = 500000
       let offset = 0
       let hasMore = true
       let rowCount = 0
       const colNames = activeCols.map((c) => c.name)
+      const primaryKeyColumns = getPrimaryKeyColumns(cols)
+      let cursor: Record<string, unknown> | null = null
+      let blob: Blob | null = null
 
-      // Collect all rows for this table
-      const allRows: Record<string, unknown>[] = []
+      try {
+        if (format === 'xlsx') {
+          const XLSX = await import('xlsx')
+          const MAX_XLSX_ROWS = 500000
+          const wsData: unknown[][] = []
+          if (includeHeader) {
+            wsData.push(colNames)
+          }
+          setExportLog((prev) => [...prev, `⚠️ ${tc.name}: xlsx 导出会在浏览器内存中组装文件，大表建议改用 CSV / SQL`])
 
-      while (hasMore) {
-        try {
-          const colList = colNames.map((c) => `\`${c.replace(/`/g, '``')}\``).join(', ')
-          const sql = `SELECT ${colList} FROM \`${selectedSchema}\`.\`${tc.name}\` LIMIT ${BATCH} OFFSET ${offset}`
-          const result = await api.runQuery(connection, sql, selectedSchema)
-          const dataResult = result.results?.[0]
+          while (hasMore) {
+            const { mode, sql } = buildBatchSelectQuery({
+              schemaName: selectedSchema,
+              tableName: tc.name,
+              selectColumns: colNames,
+              primaryKeyColumns,
+              batchSize: BATCH,
+              fallbackOffset: offset,
+              cursor,
+            })
+            const result = await api.runQuery(connection, sql, selectedSchema)
+            const dataResult = result.results?.[0]
 
-          if (dataResult?.kind === 'rows' && dataResult.rows.length > 0) {
-            allRows.push(...dataResult.rows)
-            rowCount += dataResult.rows.length
-            offset += dataResult.rows.length
-            if (dataResult.rows.length < BATCH) hasMore = false
-            if (rowCount >= MAX_ROWS) {
-              setExportLog((prev) => [...prev, `⚠️ ${tc.name}: 达到 ${MAX_ROWS} 行限制`])
+            if (dataResult?.kind === 'rows' && dataResult.rows.length > 0) {
+              for (const row of dataResult.rows) {
+                wsData.push(colNames.map((c) => row[c] ?? ''))
+              }
+              rowCount += dataResult.rows.length
+              if (mode === 'primaryKey') {
+                cursor = readPrimaryKeyCursor(dataResult.rows[dataResult.rows.length - 1], primaryKeyColumns)
+              } else {
+                offset += dataResult.rows.length
+              }
+              totalProcessed += dataResult.rows.length
+              setProgress((prev) => ({ ...prev, processed: totalProcessed, tables: ti }))
+
+              if (dataResult.rows.length < BATCH) {
+                hasMore = false
+              }
+              if (rowCount >= MAX_XLSX_ROWS) {
+                setExportLog((prev) => [...prev, `⚠️ ${tc.name}: xlsx 达到 ${MAX_XLSX_ROWS.toLocaleString()} 行限制`])
+                hasMore = false
+              }
+            } else {
               hasMore = false
             }
-          } else {
-            hasMore = false
           }
-        } catch (err) {
-          setExportLog((prev) => [...prev, `❌ ${tc.name}: ${err instanceof Error ? err.message : String(err)}`])
-          hasMore = false
-        }
-        totalProcessed += Math.min(BATCH, rowCount - (offset - BATCH))
-        setProgress((prev) => ({ ...prev, processed: totalProcessed, tables: ti }))
-      }
 
-      // Generate file content based on format
-      let blob: Blob
+          const ws = XLSX.utils.aoa_to_sheet(wsData)
+          const wb = XLSX.utils.book_new()
+          XLSX.utils.book_append_sheet(wb, ws, tc.name.slice(0, 31))
+          const xlsxData = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
+          blob = new Blob([xlsxData], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+        } else {
+          const mimeType = format === 'json'
+            ? 'application/json;charset=utf-8'
+            : 'text/plain;charset=utf-8'
+          const target = await createTextExportTarget(fileName, mimeType, useFileSystemAccess)
+          let firstJsonRow = true
 
-      if (format === 'csv' || format === 'txt') {
-        const sep = delimiter
-        let fileContent = ''
-        if (includeHeader) {
-          fileContent += colNames.map((c) => `${textQualifier}${c}${textQualifier}`).join(sep) + eol
-        }
-        for (const row of allRows) {
-          const vals = colNames.map((c) => {
-            const v = row[c]
-            if (v === null || v === undefined) return ''
-            const s = String(v)
-            if (s.includes(sep) || s.includes(textQualifier) || s.includes('\n') || s.includes('\r')) {
-              return `${textQualifier}${s.replace(new RegExp(textQualifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), textQualifier + textQualifier)}${textQualifier}`
+          if (format === 'csv' || format === 'txt') {
+            if (includeHeader) {
+              await target.write(colNames.map((c) => escapeCsvValue(c, delimiter, textQualifier)).join(delimiter) + eol)
             }
-            return s
-          })
-          fileContent += vals.join(sep) + eol
-        }
-        blob = new Blob([fileContent], { type: 'text/plain;charset=utf-8' })
+          } else if (format === 'json') {
+            await target.write('[')
+          } else {
+            await target.write(`-- Export of ${tc.name}${eol}-- Date: ${new Date().toISOString()}${eol}${eol}`)
+          }
 
-      } else if (format === 'xlsx') {
-        // Build worksheet data
-        const wsData: unknown[][] = []
-        if (includeHeader) {
-          wsData.push(colNames)
-        }
-        for (const row of allRows) {
-          wsData.push(colNames.map((c) => row[c] ?? ''))
-        }
-        const ws = XLSX.utils.aoa_to_sheet(wsData)
-        const wb = XLSX.utils.book_new()
-        XLSX.utils.book_append_sheet(wb, ws, tc.name.slice(0, 31)) // Sheet name max 31 chars
-        const xlsxData = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
-        blob = new Blob([xlsxData], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+          while (hasMore) {
+            const { mode, sql } = buildBatchSelectQuery({
+              schemaName: selectedSchema,
+              tableName: tc.name,
+              selectColumns: colNames,
+              primaryKeyColumns,
+              batchSize: BATCH,
+              fallbackOffset: offset,
+              cursor,
+            })
+            const result = await api.runQuery(connection, sql, selectedSchema)
+            const dataResult = result.results?.[0]
 
-      } else if (format === 'json') {
-        let fileContent = '['
-        let first = true
-        for (const row of allRows) {
-          const obj: Record<string, unknown> = {}
-          for (const c of colNames) { obj[c] = row[c] ?? null }
-          if (!first) fileContent += ','
-          fileContent += eol + '  ' + JSON.stringify(obj)
-          first = false
-        }
-        fileContent += eol + ']' + eol
-        blob = new Blob([fileContent], { type: 'application/json;charset=utf-8' })
+            if (dataResult?.kind === 'rows' && dataResult.rows.length > 0) {
+              rowCount += dataResult.rows.length
+              if (mode === 'primaryKey') {
+                cursor = readPrimaryKeyCursor(dataResult.rows[dataResult.rows.length - 1], primaryKeyColumns)
+              } else {
+                offset += dataResult.rows.length
+              }
+              totalProcessed += dataResult.rows.length
+              setProgress((prev) => ({ ...prev, processed: totalProcessed, tables: ti }))
 
-      } else {
-        // SQL
-        let fileContent = `-- Export of ${tc.name}${eol}-- Date: ${new Date().toISOString()}${eol}${eol}`
-        for (const row of allRows) {
-          const vals = colNames.map((c) => {
-            const v = row[c]
-            if (v === null || v === undefined) return 'NULL'
-            return `'${String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
-          })
-          fileContent += `INSERT INTO \`${tc.name}\` (${colNames.map((c) => `\`${c}\``).join(', ')}) VALUES (${vals.join(', ')});${eol}`
+              let chunk = ''
+              if (format === 'csv' || format === 'txt') {
+                chunk = dataResult.rows.map((row) =>
+                  colNames
+                    .map((columnName) => escapeCsvValue(row[columnName], delimiter, textQualifier))
+                    .join(delimiter),
+                ).join(eol)
+                if (chunk) {
+                  chunk += eol
+                }
+              } else if (format === 'json') {
+                chunk = dataResult.rows.map((row) => {
+                  const obj: Record<string, unknown> = {}
+                  for (const columnName of colNames) {
+                    obj[columnName] = row[columnName] ?? null
+                  }
+                  const prefix = firstJsonRow ? `${eol}  ` : `,${eol}  `
+                  firstJsonRow = false
+                  return prefix + JSON.stringify(obj)
+                }).join('')
+              } else {
+                chunk = dataResult.rows.map((row) =>
+                  `INSERT INTO \`${tc.name}\` (${colNames.map((columnName) => `\`${columnName}\``).join(', ')}) VALUES (${colNames.map((columnName) => toSqlLiteral(row[columnName])).join(', ')});`,
+                ).join(eol)
+                if (chunk) {
+                  chunk += eol
+                }
+              }
+
+              if (chunk) {
+                await target.write(chunk)
+              }
+
+              if (dataResult.rows.length < BATCH) {
+                hasMore = false
+              }
+            } else {
+              hasMore = false
+            }
+          }
+
+          if (format === 'json') {
+            await target.write((firstJsonRow ? '' : eol) + ']' + eol)
+          }
+
+          blob = await target.close()
         }
-        blob = new Blob([fileContent], { type: 'text/plain;charset=utf-8' })
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          setExportLog((prev) => [...prev, '⏹️ 已取消导出'])
+          setExporting(false)
+          return
+        }
+
+        setExportLog((prev) => [...prev, `❌ ${tc.name}: ${err instanceof Error ? err.message : String(err)}`])
+        continue
       }
 
-      allFiles.push({ name: tc.fileName, blob })
+      if (blob) {
+        allFiles.push({ name: fileName, blob })
+      }
+      completedExports += 1
       setExportLog((prev) => [...prev, `✅ ${tc.name}: ${rowCount.toLocaleString()} 行`])
       setProgress((prev) => ({ ...prev, total: prev.total + rowCount, tables: ti + 1 }))
     }
@@ -326,7 +496,7 @@ export default function ExportWizard({
 
     setExportDone(true)
     setExporting(false)
-    onFlash('success', `导出完成: ${allFiles.length} 个文件`)
+    onFlash('success', `导出完成: ${completedExports} 个文件`)
   }
 
   function triggerDownloadBlob(fileName: string, blob: Blob) {

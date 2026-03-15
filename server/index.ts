@@ -3,12 +3,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  cancelActiveQuery,
   closePools,
   disposeConnection,
   executeSql,
+  executeStatements,
   fetchSchemaTree,
   fetchTableColumns,
+  fetchTableMetadata,
   normalizeConnectionPayload,
+  QueryCancelledError,
   testConnection,
 } from './mysql.js'
 import { importBatch } from './import.js'
@@ -79,21 +83,79 @@ app.post('/api/schema/table', async (request, response) => {
   }
 })
 
+app.post('/api/schema/table-meta', async (request, response) => {
+  try {
+    const connection = normalizeConnectionPayload(request.body.connection)
+    const schemaName = String(request.body.schemaName ?? '').trim()
+    const tableName = String(request.body.tableName ?? '').trim()
+
+    if (!schemaName || !tableName) {
+      throw new Error('Schema and table are required.')
+    }
+
+    const metadata = await fetchTableMetadata(connection, schemaName, tableName)
+    response.json(metadata)
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'Could not inspect table metadata.',
+    })
+  }
+})
+
 app.post('/api/query', async (request, response) => {
   try {
     const connection = normalizeConnectionPayload(request.body.connection)
     const sql = String(request.body.sql ?? '')
     const database = request.body.database ? String(request.body.database).trim() : undefined
+    const queryId = request.body.queryId ? String(request.body.queryId).trim() : undefined
     const startedAt = Date.now()
-    const results = await executeSql(connection, sql, database)
+    const results = await executeSql(connection, sql, database, queryId)
     response.json({
       durationMs: Date.now() - startedAt,
       results,
     })
   } catch (error) {
     console.error('[/api/query] ERROR')
-    response.status(400).json({
+    response.status(error instanceof QueryCancelledError ? 409 : 400).json({
       error: error instanceof Error ? error.message : 'SQL execution failed.',
+    })
+  }
+})
+
+app.post('/api/query/batch', async (request, response) => {
+  try {
+    const connection = normalizeConnectionPayload(request.body.connection)
+    const statements = Array.isArray(request.body.statements)
+      ? request.body.statements.map((statement: unknown) => String(statement ?? ''))
+      : []
+    const database = request.body.database ? String(request.body.database).trim() : undefined
+    const transaction = request.body.transaction !== false
+    const startedAt = Date.now()
+    const results = await executeStatements(connection, statements, database, transaction)
+    response.json({
+      durationMs: Date.now() - startedAt,
+      results,
+    })
+  } catch (error) {
+    console.error('[/api/query/batch] ERROR')
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'Batch SQL execution failed.',
+    })
+  }
+})
+
+app.post('/api/query/cancel', async (request, response) => {
+  try {
+    const queryId = String(request.body.queryId ?? '').trim()
+    if (!queryId) {
+      throw new Error('Query ID is required.')
+    }
+
+    const ok = await cancelActiveQuery(queryId)
+    response.json({ ok })
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'Could not cancel query.',
     })
   }
 })

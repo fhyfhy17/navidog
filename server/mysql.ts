@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import mysql, {
   type FieldPacket,
   type Pool,
+  type PoolConnection,
   type ResultSetHeader,
   type RowDataPacket,
 } from 'mysql2/promise'
@@ -59,6 +60,29 @@ export type TableColumnInfo = {
   type: string
   nullable: boolean
   key: string
+  extra?: string
+  defaultValue?: string
+  comment?: string
+}
+
+export type TableIndexInfo = {
+  name: string
+  unique: boolean
+  primary: boolean
+  type: string
+  columns: string[]
+  cardinality?: number | null
+  comment?: string
+}
+
+export type TableForeignKeyInfo = {
+  name: string
+  columns: string[]
+  referencedSchema: string
+  referencedTable: string
+  referencedColumns: string[]
+  onUpdate: string
+  onDelete: string
 }
 
 export type QueryResultSet =
@@ -87,14 +111,36 @@ type TunnelRecord = {
   close: () => void
 }
 
+type ActiveQueryRecord = {
+  cancelled: boolean
+  connection: PoolConnection & { destroy?: () => void; connection?: { destroy?: () => void } }
+}
+
 const pools = new Map<string, Pool>()
 const pendingPools = new Map<string, Promise<Pool>>()
+const activeQueries = new Map<string, ActiveQueryRecord>()
 const hiddenSchemas = new Set([
   'information_schema',
   'mysql',
   'performance_schema',
   'sys',
 ])
+
+export class QueryCancelledError extends Error {
+  constructor() {
+    super('Query was cancelled.')
+    this.name = 'QueryCancelledError'
+  }
+}
+
+function destroyPoolConnection(connection: ActiveQueryRecord['connection']) {
+  if (typeof connection.destroy === 'function') {
+    connection.destroy()
+    return
+  }
+
+  connection.connection?.destroy?.()
+}
 
 function readBoolean(value: unknown, fallback: boolean) {
   if (typeof value === 'boolean') {
@@ -507,6 +553,12 @@ export async function disposeConnection(config: ConnectionConfig) {
 }
 
 export async function closePools() {
+  for (const [, activeQuery] of activeQueries) {
+    activeQuery.cancelled = true
+    destroyPoolConnection(activeQuery.connection)
+  }
+  activeQueries.clear()
+
   await Promise.all(Array.from(pools.values(), (pool) => pool.end()))
   pools.clear()
   for (const tunnel of sshTunnels.values()) {
@@ -607,7 +659,143 @@ export async function fetchTableColumns(
         type: String(row.Type ?? ''),
         nullable: String(row.Null ?? '').toUpperCase() === 'YES',
         key: String(row.Key ?? ''),
+        extra: String(row.Extra ?? ''),
+        defaultValue: row.Default != null ? String(row.Default) : undefined,
+        comment: row.Comment ? String(row.Comment) : undefined,
       }))
+    }),
+  )
+}
+
+export async function fetchTableMetadata(
+  config: ConnectionConfig,
+  schemaName: string,
+  tableName: string,
+): Promise<{ indexes: TableIndexInfo[]; foreignKeys: TableForeignKeyInfo[] }> {
+  return withSslFallback(config, (effectiveConfig) =>
+    withReconnect(effectiveConfig, async () => {
+      const pool = await getPool(effectiveConfig)
+      const [indexRows] = await pool.query<RowDataPacket[]>(
+        `SHOW INDEX FROM ${q(schemaName)}.${q(tableName)}`,
+      )
+
+      const indexesByName = new Map<string, {
+        name: string
+        unique: boolean
+        primary: boolean
+        type: string
+        cardinality?: number | null
+        comment?: string
+        columns: { seq: number; name: string }[]
+      }>()
+
+      for (const row of indexRows) {
+        const indexName = String(row.Key_name ?? '')
+        if (!indexName) continue
+
+        const existing = indexesByName.get(indexName) ?? {
+          name: indexName,
+          unique: Number(row.Non_unique ?? 1) === 0,
+          primary: indexName === 'PRIMARY',
+          type: String(row.Index_type ?? ''),
+          cardinality: row.Cardinality != null ? Number(row.Cardinality) : null,
+          comment: row.Index_comment ? String(row.Index_comment) : undefined,
+          columns: [],
+        }
+
+        existing.columns.push({
+          seq: Number(row.Seq_in_index ?? existing.columns.length + 1),
+          name: String(row.Column_name ?? ''),
+        })
+
+        indexesByName.set(indexName, existing)
+      }
+
+      const indexes = Array.from(indexesByName.values())
+        .map((index) => ({
+          name: index.name,
+          unique: index.unique,
+          primary: index.primary,
+          type: index.type,
+          columns: index.columns
+            .sort((a, b) => a.seq - b.seq)
+            .map((column) => column.name),
+          cardinality: index.cardinality ?? null,
+          comment: index.comment,
+        }))
+        .sort((a, b) => {
+          if (a.primary && !b.primary) return -1
+          if (!a.primary && b.primary) return 1
+          return a.name.localeCompare(b.name)
+        })
+
+      const [fkRows] = await pool.query<RowDataPacket[]>(
+        `
+          SELECT
+            kcu.CONSTRAINT_NAME AS constraintName,
+            kcu.COLUMN_NAME AS columnName,
+            kcu.ORDINAL_POSITION AS ordinalPosition,
+            kcu.REFERENCED_TABLE_SCHEMA AS referencedSchema,
+            kcu.REFERENCED_TABLE_NAME AS referencedTable,
+            kcu.REFERENCED_COLUMN_NAME AS referencedColumn,
+            rc.UPDATE_RULE AS updateRule,
+            rc.DELETE_RULE AS deleteRule
+          FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+          INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+            ON rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
+           AND rc.TABLE_NAME = kcu.TABLE_NAME
+           AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+          WHERE kcu.TABLE_SCHEMA = ?
+            AND kcu.TABLE_NAME = ?
+            AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+          ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
+        `,
+        [schemaName, tableName],
+      )
+
+      const foreignKeysByName = new Map<string, {
+        name: string
+        referencedSchema: string
+        referencedTable: string
+        onUpdate: string
+        onDelete: string
+        columns: { seq: number; name: string }[]
+        referencedColumns: { seq: number; name: string }[]
+      }>()
+
+      for (const row of fkRows) {
+        const name = String(row.constraintName ?? '')
+        if (!name) continue
+
+        const existing = foreignKeysByName.get(name) ?? {
+          name,
+          referencedSchema: String(row.referencedSchema ?? schemaName),
+          referencedTable: String(row.referencedTable ?? ''),
+          onUpdate: String(row.updateRule ?? 'RESTRICT'),
+          onDelete: String(row.deleteRule ?? 'RESTRICT'),
+          columns: [],
+          referencedColumns: [],
+        }
+
+        const seq = Number(row.ordinalPosition ?? existing.columns.length + 1)
+        existing.columns.push({ seq, name: String(row.columnName ?? '') })
+        existing.referencedColumns.push({ seq, name: String(row.referencedColumn ?? '') })
+        foreignKeysByName.set(name, existing)
+      }
+
+      const foreignKeys = Array.from(foreignKeysByName.values()).map((fk) => ({
+        name: fk.name,
+        columns: fk.columns.sort((a, b) => a.seq - b.seq).map((column) => column.name),
+        referencedSchema: fk.referencedSchema,
+        referencedTable: fk.referencedTable,
+        referencedColumns: fk.referencedColumns
+          .sort((a, b) => a.seq - b.seq)
+          .map((column) => column.name),
+        onUpdate: fk.onUpdate,
+        onDelete: fk.onDelete,
+      }))
+
+      return { indexes, foreignKeys }
     }),
   )
 }
@@ -666,10 +854,38 @@ function normalizeSingleResult(
   }
 }
 
+function normalizeQueryPayload(
+  rows: unknown,
+  fields: FieldPacket[] | FieldPacket[][] | undefined,
+  startIndex = 0,
+): QueryResultSet[] {
+  if (
+    Array.isArray(rows) &&
+    rows.some((entry) => Array.isArray(entry) || isResultSetHeader(entry))
+  ) {
+    return rows.map((entry, index) => {
+      const fieldSet =
+        Array.isArray(fields) && Array.isArray(fields[index])
+          ? (fields[index] as FieldPacket[])
+          : undefined
+
+      return normalizeSingleResult(entry, fieldSet, startIndex + index)
+    })
+  }
+
+  const singleFieldSet =
+    Array.isArray(fields) && fields.length > 0 && !Array.isArray(fields[0])
+      ? (fields as FieldPacket[])
+      : undefined
+
+  return [normalizeSingleResult(rows, singleFieldSet, startIndex)]
+}
+
 export async function executeSql(
   config: ConnectionConfig,
   sql: string,
   database?: string,
+  queryId?: string,
 ): Promise<QueryResultSet[]> {
   const trimmedSql = sql.trim()
 
@@ -680,7 +896,14 @@ export async function executeSql(
   return withSslFallback(config, (effectiveConfig) =>
     withReconnect(effectiveConfig, async () => {
       const pool = await getPool(effectiveConfig)
-      const conn = await pool.getConnection()
+      const conn = await pool.getConnection() as PoolConnection & { destroy?: () => void; connection?: { destroy?: () => void } }
+      const activeQuery = queryId
+        ? { cancelled: false, connection: conn }
+        : null
+
+      if (queryId && activeQuery) {
+        activeQueries.set(queryId, activeQuery)
+      }
 
       try {
         if (database) {
@@ -688,30 +911,97 @@ export async function executeSql(
         }
 
         const [rows, fields] = await conn.query(trimmedSql)
-
-        if (
-          Array.isArray(rows) &&
-          rows.some((entry) => Array.isArray(entry) || isResultSetHeader(entry))
-        ) {
-          return rows.map((entry, index) => {
-            const fieldSet =
-              Array.isArray(fields) && Array.isArray(fields[index])
-                ? (fields[index] as FieldPacket[])
-                : undefined
-
-            return normalizeSingleResult(entry, fieldSet, index)
-          })
+        return normalizeQueryPayload(rows, fields)
+      } catch (error) {
+        if (activeQuery?.cancelled) {
+          throw new QueryCancelledError()
         }
-
-        const singleFieldSet =
-          Array.isArray(fields) && fields.length > 0 && !Array.isArray(fields[0])
-            ? (fields as FieldPacket[])
-            : undefined
-
-        return [normalizeSingleResult(rows, singleFieldSet, 0)]
+        throw error
       } finally {
-        conn.release()
+        if (queryId) {
+          activeQueries.delete(queryId)
+        }
+        try {
+          conn.release()
+        } catch {
+          // Destroyed connections may already be closed.
+        }
       }
     }),
   )
+}
+
+export async function executeStatements(
+  config: ConnectionConfig,
+  statements: string[],
+  database?: string,
+  transaction = false,
+): Promise<QueryResultSet[]> {
+  const trimmedStatements = statements
+    .map((statement) => statement.trim())
+    .filter(Boolean)
+
+  if (trimmedStatements.length === 0) {
+    throw new Error('No SQL statements provided.')
+  }
+
+  return withSslFallback(config, async (effectiveConfig) => {
+    const pool = await getPool(effectiveConfig)
+    const conn = await pool.getConnection()
+    let transactionStarted = false
+
+    try {
+      if (database) {
+        await conn.query(`USE \`${database.replaceAll('`', '``')}\``)
+      }
+
+      if (transaction) {
+        await conn.beginTransaction()
+        transactionStarted = true
+      }
+
+      const results: QueryResultSet[] = []
+
+      for (let index = 0; index < trimmedStatements.length; index += 1) {
+        const statement = trimmedStatements[index]
+
+        try {
+          const [rows, fields] = await conn.query(statement)
+          results.push(...normalizeQueryPayload(rows, fields, results.length))
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new Error(`Statement ${index + 1} failed: ${message}`)
+        }
+      }
+
+      if (transactionStarted) {
+        await conn.commit()
+        transactionStarted = false
+      }
+
+      return results
+    } catch (error) {
+      if (transactionStarted) {
+        await conn.rollback().catch(() => undefined)
+      }
+      throw formatConnectionError(effectiveConfig, error)
+    } finally {
+      try {
+        conn.release()
+      } catch {
+        // Destroyed connections may already be closed.
+      }
+    }
+  })
+}
+
+export async function cancelActiveQuery(queryId: string): Promise<boolean> {
+  const activeQuery = activeQueries.get(queryId)
+  if (!activeQuery) {
+    return false
+  }
+
+  activeQuery.cancelled = true
+  destroyPoolConnection(activeQuery.connection)
+  return true
 }

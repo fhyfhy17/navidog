@@ -1,6 +1,4 @@
 import { useEffect, useRef, useState } from 'react'
-import Papa from 'papaparse'
-import * as XLSX from 'xlsx'
 import { api } from '../api'
 import type { ConnectionProfile, ImportCreateTablePlan, SchemaNode, TableColumn } from '../types'
 
@@ -207,6 +205,7 @@ export default function ImportWizard({
   const [sourceFields, setSourceFields] = useState<string[]>([])
   const [totalRowCount, setTotalRowCount] = useState(0)
   const [fileType, setFileType] = useState<'csv' | 'json' | 'excel' | 'sql'>('csv')
+  const [parsingFile, setParsingFile] = useState(false)
 
   /* Step 2: Target */
   const [targetSchema, setTargetSchema] = useState(initialSchema ?? '')
@@ -275,61 +274,72 @@ export default function ImportWizard({
   }
 
   /* ── Parse file ────────────────────────── */
-  function parseFile() {
+  async function parseFile() {
     if (!rawFile) return
+
+    setParsingFile(true)
 
     if (fileType === 'json') {
       parseJsonFile()
     } else if (fileType === 'excel') {
-      parseExcelFile()
+      await parseExcelFile()
     } else if (fileType === 'sql') {
       parseSqlFile()
     } else {
-      parseCsvFile()
+      await parseCsvFile()
     }
   }
 
-  function parseCsvFile() {
+  async function parseCsvFile() {
     if (!rawFile) return
-    Papa.parse(rawFile, {
-      delimiter: delimiter === 'auto' ? undefined : delimiter,
-      header: hasHeader,
-      encoding,
-      skipEmptyLines: true,
-      dynamicTyping: true,
-      complete: (results) => {
-        if (hasHeader) {
-          const fields = results.meta.fields ?? []
-          setSourceFields(fields)
-          const rows = results.data as Record<string, unknown>[]
-          setAllParsedRows(rows)
-          setTotalRowCount(rows.length)
-          const preview = rows.slice(0, 20).map((row) =>
-            fields.map((f) => {
-              const v = row[f]
-              return v === null || v === undefined ? '' : String(v)
-            }),
-          )
-          setPreviewRows(preview)
-        } else {
-          const data = results.data as string[][]
-          const fields = data[0]?.map((_, i) => `Column ${i + 1}`) ?? []
-          setSourceFields(fields)
-          const rows = data.map((row) => {
-            const obj: Record<string, unknown> = {}
-            fields.forEach((f, i) => { obj[f] = row[i] })
-            return obj
-          })
-          setAllParsedRows(rows)
-          setTotalRowCount(rows.length)
-          setPreviewRows(data.slice(0, 20))
-        }
-        setStep(1)
-      },
-      error: (err) => {
-        onFlash('error', `解析失败: ${err.message}`)
-      },
-    })
+
+    try {
+      const { default: Papa } = await import('papaparse')
+      Papa.parse(rawFile, {
+        delimiter: delimiter === 'auto' ? undefined : delimiter,
+        header: hasHeader,
+        encoding,
+        skipEmptyLines: true,
+        dynamicTyping: true,
+        complete: (results) => {
+          if (hasHeader) {
+            const fields = results.meta.fields ?? []
+            setSourceFields(fields)
+            const rows = results.data as Record<string, unknown>[]
+            setAllParsedRows(rows)
+            setTotalRowCount(rows.length)
+            const preview = rows.slice(0, 20).map((row) =>
+              fields.map((f) => {
+                const v = row[f]
+                return v === null || v === undefined ? '' : String(v)
+              }),
+            )
+            setPreviewRows(preview)
+          } else {
+            const data = results.data as string[][]
+            const fields = data[0]?.map((_, i) => `Column ${i + 1}`) ?? []
+            setSourceFields(fields)
+            const rows = data.map((row) => {
+              const obj: Record<string, unknown> = {}
+              fields.forEach((f, i) => { obj[f] = row[i] })
+              return obj
+            })
+            setAllParsedRows(rows)
+            setTotalRowCount(rows.length)
+            setPreviewRows(data.slice(0, 20))
+          }
+          setParsingFile(false)
+          setStep(1)
+        },
+        error: (err) => {
+          setParsingFile(false)
+          onFlash('error', `解析失败: ${err.message}`)
+        },
+      })
+    } catch (err) {
+      setParsingFile(false)
+      onFlash('error', `加载 CSV 解析器失败: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   function parseJsonFile() {
@@ -344,11 +354,13 @@ export default function ImportWizard({
           if (data.data && Array.isArray(data.data)) data = data.data
           else if (data.rows && Array.isArray(data.rows)) data = data.rows
           else {
+            setParsingFile(false)
             onFlash('error', 'JSON 文件必须是数组格式')
             return
           }
         }
         if (data.length === 0) {
+          setParsingFile(false)
           onFlash('error', 'JSON 文件为空')
           return
         }
@@ -363,46 +375,66 @@ export default function ImportWizard({
           }),
         )
         setPreviewRows(preview)
+        setParsingFile(false)
         setStep(1)
       } catch (err) {
+        setParsingFile(false)
         onFlash('error', `JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`)
       }
+    }
+    reader.onerror = () => {
+      setParsingFile(false)
+      onFlash('error', '读取 JSON 文件失败')
     }
     reader.readAsText(rawFile, encoding)
   }
 
-  function parseExcelFile() {
+  async function parseExcelFile() {
     if (!rawFile) return
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      try {
-        const data = new Uint8Array(e.target?.result as ArrayBuffer)
-        const workbook = XLSX.read(data, { type: 'array' })
-        const sheetName = workbook.SheetNames[0]
-        const sheet = workbook.Sheets[sheetName]
-        const jsonData = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' })
 
-        if (jsonData.length === 0) {
-          onFlash('error', 'Excel 文件为空')
-          return
+    try {
+      const XLSX = await import('xlsx')
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target?.result as ArrayBuffer)
+          const workbook = XLSX.read(data, { type: 'array' })
+          const sheetName = workbook.SheetNames[0]
+          const sheet = workbook.Sheets[sheetName]
+          const jsonData = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' })
+
+          if (jsonData.length === 0) {
+            setParsingFile(false)
+            onFlash('error', 'Excel 文件为空')
+            return
+          }
+          const fields = Object.keys(jsonData[0])
+          setSourceFields(fields)
+          setAllParsedRows(jsonData)
+          setTotalRowCount(jsonData.length)
+          const preview = jsonData.slice(0, 20).map((row) =>
+            fields.map((f) => {
+              const v = row[f]
+              return v === null || v === undefined ? '' : String(v)
+            }),
+          )
+          setPreviewRows(preview)
+          setParsingFile(false)
+          setStep(1)
+        } catch (err) {
+          setParsingFile(false)
+          onFlash('error', `Excel 解析失败: ${err instanceof Error ? err.message : String(err)}`)
         }
-        const fields = Object.keys(jsonData[0])
-        setSourceFields(fields)
-        setAllParsedRows(jsonData)
-        setTotalRowCount(jsonData.length)
-        const preview = jsonData.slice(0, 20).map((row) =>
-          fields.map((f) => {
-            const v = row[f]
-            return v === null || v === undefined ? '' : String(v)
-          }),
-        )
-        setPreviewRows(preview)
-        setStep(1)
-      } catch (err) {
-        onFlash('error', `Excel 解析失败: ${err instanceof Error ? err.message : String(err)}`)
       }
+      reader.onerror = () => {
+        setParsingFile(false)
+        onFlash('error', '读取 Excel 文件失败')
+      }
+      reader.readAsArrayBuffer(rawFile)
+    } catch (err) {
+      setParsingFile(false)
+      onFlash('error', `加载 Excel 解析器失败: ${err instanceof Error ? err.message : String(err)}`)
     }
-    reader.readAsArrayBuffer(rawFile)
   }
 
   function parseSqlFile() {
@@ -434,6 +466,7 @@ export default function ImportWizard({
           rows.push(row)
         }
         if (rows.length === 0) {
+          setParsingFile(false)
           onFlash('error', 'SQL 文件中未找到 INSERT 语句')
           return
         }
@@ -447,10 +480,16 @@ export default function ImportWizard({
           }),
         )
         setPreviewRows(preview)
+        setParsingFile(false)
         setStep(1)
       } catch (err) {
+        setParsingFile(false)
         onFlash('error', `SQL 解析失败: ${err instanceof Error ? err.message : String(err)}`)
       }
+    }
+    reader.onerror = () => {
+      setParsingFile(false)
+      onFlash('error', '读取 SQL 文件失败')
     }
     reader.readAsText(rawFile, encoding)
   }
@@ -941,7 +980,7 @@ export default function ImportWizard({
 
   async function handleNext() {
     if (step === 0) {
-      parseFile()
+      void parseFile()
       return
     }
     if (step === 1) {
@@ -1050,10 +1089,10 @@ export default function ImportWizard({
           {step < 4 && (
             <button
               className="import-btn import-btn-primary"
-              disabled={!canNext}
-              onClick={handleNext}
+              disabled={!canNext || parsingFile}
+              onClick={() => void handleNext()}
             >
-              {step === 3 ? '开始导入' : '下一步 →'}
+              {step === 0 && parsingFile ? '解析中...' : step === 3 ? '开始导入' : '下一步 →'}
             </button>
           )}
           {step === 4 && stats.done && (

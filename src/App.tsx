@@ -1,6 +1,9 @@
-import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import SqlEditor from './components/SqlEditor'
+import type { SqlEditorHandle } from './components/SqlEditor'
+import TableDesigner from './components/TableDesigner'
+import type { ColumnDef } from './components/TableDesigner'
 import ImportWizard from './components/ImportWizard'
 import ExportWizard from './components/ExportWizard'
 import type {
@@ -8,10 +11,13 @@ import type {
   CliTab,
   ConnectionProfile,
   DataTab,
+  DesignTab,
   QueryTab,
   SchemaNode,
   SelectedNode,
   TableColumn,
+  TableForeignKey,
+  TableIndex,
 } from './types'
 
 /* ═══════════════════════════════════════════════
@@ -20,6 +26,9 @@ import type {
 
 const STORAGE_PROFILES = 'navidog.profiles.v1'
 const STORAGE_HISTORY = 'navidog.history.v1'
+const STORAGE_QUERY_SNIPPETS = 'navidog.query-snippets.v1'
+const STORAGE_QUERY_TABS = 'navidog.query-tabs.v1'
+const STORAGE_ACTIVE_QUERY_TAB = 'navidog.active-query-tab.v1'
 const PAGE_SIZE = 1000
 
 /* ═══════════════════════════════════════════════
@@ -56,6 +65,121 @@ function formatBytes(bytes: number): string {
   const i = Math.floor(Math.log(bytes) / Math.log(1024))
   const val = bytes / Math.pow(1024, i)
   return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`
+}
+
+function isQueryCancelledMessage(error: unknown) {
+  return error instanceof Error && error.message === 'Query was cancelled.'
+}
+
+function escapeCsvValue(value: unknown) {
+  if (value === null || value === undefined) return ''
+  const text = String(value)
+  if (/[",\n\r]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`
+  }
+  return text
+}
+
+function downloadTextFile(fileName: string, content: string, mimeType = 'text/plain;charset=utf-8') {
+  const blob = new Blob([content], { type: mimeType })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function buildResultFileName(schemaName: string, resultIndex: number, extension: 'csv' | 'json') {
+  const base = (schemaName || 'query')
+    .replace(/[^\w.-]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'query'
+  return `${base}-result-${resultIndex + 1}.${extension}`
+}
+
+type SavePickerWindow = Window & {
+  showSaveFilePicker?: (options: {
+    suggestedName: string
+    types: Array<{
+      description: string
+      accept: Record<string, string[]>
+    }>
+  }) => Promise<FileSystemFileHandle>
+}
+
+type QuerySnippet = {
+  id: string
+  name: string
+  sql: string
+  connectionId?: string
+  schemaName?: string
+  updatedAt: number
+}
+
+type PersistedQueryTab = {
+  id: string
+  title: string
+  connectionId: string
+  schemaName: string
+  sql: string
+}
+
+function readPersistedQueryTabs(): QueryTab[] {
+  const stored = readStorage<PersistedQueryTab[]>(STORAGE_QUERY_TABS, [])
+  return stored.map((tab) => ({
+    ...tab,
+    kind: 'query' as const,
+    results: [],
+    activeResultIndex: 0,
+    durationMs: 0,
+    loading: false,
+  }))
+}
+
+function createRafUpdater<T>(apply: (value: T) => void) {
+  let frameId = 0
+  let pendingValue: T | null = null
+
+  function flush() {
+    if (frameId) {
+      window.cancelAnimationFrame(frameId)
+      frameId = 0
+    }
+    if (pendingValue === null) return
+    const value = pendingValue
+    pendingValue = null
+    apply(value)
+  }
+
+  return {
+    schedule(value: T) {
+      pendingValue = value
+      if (frameId) return
+      frameId = window.requestAnimationFrame(() => {
+        frameId = 0
+        flush()
+      })
+    },
+    flush,
+    cancel() {
+      if (frameId) {
+        window.cancelAnimationFrame(frameId)
+        frameId = 0
+      }
+      pendingValue = null
+    },
+  }
+}
+
+const QUERY_ROW_NUM_WIDTH = 44
+const QUERY_MIN_COL_WIDTH = 96
+const QUERY_MAX_AUTO_COL_WIDTH = 280
+
+function estimateQueryColumnWidth(column: string) {
+  return Math.max(
+    QUERY_MIN_COL_WIDTH,
+    Math.min(QUERY_MAX_AUTO_COL_WIDTH, 36 + column.length * 10),
+  )
 }
 
 /** Lightweight SQL syntax highlighter for DDL display */
@@ -156,6 +280,667 @@ function draftToProfile(d: ConnectionDraft): ConnectionProfile {
 }
 
 /* ═══════════════════════════════════════════════
+   Virtual-scroll query grid (standalone component)
+   ═══════════════════════════════════════════════ */
+
+const ROW_HEIGHT = 28
+const OVERSCAN = 10
+
+const VirtualQueryGrid = memo(function VirtualQueryGrid({
+  columns,
+  rows,
+}: {
+  columns: string[]
+  rows: Record<string, unknown>[]
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewHeight, setViewHeight] = useState(400)
+  const [manualColumnWidths, setManualColumnWidths] = useState<Record<string, number>>({})
+  const scrollUpdaterRef = useRef(createRafUpdater<number>((value) => {
+    setScrollTop((prev) => (prev === value ? prev : value))
+  }))
+  const columnWidths = useMemo(
+    () => Object.fromEntries(
+      columns.map((column) => [column, manualColumnWidths[column] ?? estimateQueryColumnWidth(column)]),
+    ),
+    [columns, manualColumnWidths],
+  )
+
+  // Observe container size
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    setViewHeight((prev) => (prev === el.clientHeight ? prev : el.clientHeight))
+    const ro = new ResizeObserver(() => {
+      const nextHeight = el.clientHeight
+      setViewHeight((prev) => (prev === nextHeight ? prev : nextHeight))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => () => {
+    scrollUpdaterRef.current.cancel()
+  }, [])
+
+  // Reset scroll when data changes
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0
+  }, [rows])
+
+  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
+  const visibleCount = Math.ceil(viewHeight / ROW_HEIGHT) + OVERSCAN * 2
+  const endIdx = Math.min(rows.length, startIdx + visibleCount)
+  const topPad = startIdx * ROW_HEIGHT
+  const bottomPad = Math.max(0, (rows.length - endIdx) * ROW_HEIGHT)
+  const visibleRows = useMemo(() => rows.slice(startIdx, endIdx), [rows, startIdx, endIdx])
+  const tableWidth = useMemo(
+    () => QUERY_ROW_NUM_WIDTH + columns.reduce((total, column) => total + (columnWidths[column] ?? estimateQueryColumnWidth(column)), 0),
+    [columnWidths, columns],
+  )
+
+  const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    scrollUpdaterRef.current.schedule((e.target as HTMLElement).scrollTop)
+  }, [])
+
+  const handleColumnResizeStart = useCallback((column: string, e: React.MouseEvent<HTMLSpanElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startW = columnWidths[column] ?? estimateQueryColumnWidth(column)
+    const widthUpdater = createRafUpdater<number>((width) => {
+      setManualColumnWidths((prev) => (prev[column] === width ? prev : { ...prev, [column]: width }))
+    })
+
+    function onMove(ev: MouseEvent) {
+      const width = Math.max(QUERY_MIN_COL_WIDTH, startW + ev.clientX - startX)
+      widthUpdater.schedule(width)
+    }
+
+    function onUp() {
+      widthUpdater.flush()
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.userSelect = ''
+      document.body.style.cursor = ''
+    }
+
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [columnWidths])
+
+  return (
+    <div
+      ref={scrollRef}
+      className="virtual-grid-scroll"
+      style={{ flex: 1, overflow: 'auto', minHeight: 0 }}
+      onScroll={handleScroll}
+    >
+      <table className="data-grid query-result-grid" style={{ width: tableWidth, minWidth: tableWidth }}>
+        <colgroup>
+          <col style={{ width: QUERY_ROW_NUM_WIDTH, minWidth: QUERY_ROW_NUM_WIDTH }} />
+          {columns.map((column) => {
+            const width = columnWidths[column] ?? estimateQueryColumnWidth(column)
+            return <col key={column} style={{ width, minWidth: width }} />
+          })}
+        </colgroup>
+        <thead>
+          <tr>
+            <th className="row-num-header">#</th>
+            {columns.map((col) => {
+              const width = columnWidths[col] ?? estimateQueryColumnWidth(col)
+              return (
+                <th key={col} style={{ width, minWidth: width }}>
+                  {col}
+                  <span className="col-resize-handle" onMouseDown={(e) => handleColumnResizeStart(col, e)} />
+                </th>
+              )
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {topPad > 0 && <tr style={{ height: topPad }} />}
+          {visibleRows.map((row, vi) => {
+            const i = startIdx + vi
+            return (
+              <tr key={i} style={{ height: ROW_HEIGHT }}>
+                <td className="row-num">{i + 1}</td>
+                {columns.map((col) => {
+                  const { text, isNull } = formatCell(row[col])
+                  const width = columnWidths[col] ?? estimateQueryColumnWidth(col)
+                  return (
+                    <td key={col} className={isNull ? 'cell-null' : ''} style={{ width, minWidth: width, maxWidth: width }}>
+                      {text}
+                    </td>
+                  )
+                })}
+              </tr>
+            )
+          })}
+          {bottomPad > 0 && <tr style={{ height: bottomPad }} />}
+        </tbody>
+      </table>
+    </div>
+  )
+})
+
+type QueryResultsPaneProps = {
+  results: QueryTab['results']
+  activeResultIndex: number
+  durationMs: number
+  onSetActiveResult: (index: number) => void
+  onExportActiveResult: (format: 'csv' | 'json') => void
+}
+
+const QueryResultsPane = memo(function QueryResultsPane({
+  results,
+  activeResultIndex,
+  durationMs,
+  onSetActiveResult,
+  onExportActiveResult,
+}: QueryResultsPaneProps) {
+  const activeResult = results[activeResultIndex] ?? null
+  const activeRowsResult = activeResult?.kind === 'rows' ? activeResult : null
+
+  return (
+    <div className="query-results">
+      {results.length > 0 && (
+        <div className="result-view-tabs">
+          {results.some(r => r.kind === 'rows') && results.map((r, i) => r.kind === 'rows' ? (
+            <button
+              key={i}
+              className={`result-view-tab${activeResultIndex === i ? ' active' : ''}`}
+              onClick={() => onSetActiveResult(i)}
+            >
+              {r.title || `结果 ${i + 1}`}
+            </button>
+          ) : null)}
+          <button
+            className={`result-view-tab${activeResultIndex === -1 ? ' active' : ''}`}
+            onClick={() => onSetActiveResult(-1)}
+          >
+            消息
+          </button>
+          <button
+            className={`result-view-tab${activeResultIndex === -2 ? ' active' : ''}`}
+            onClick={() => onSetActiveResult(-2)}
+          >
+            摘要
+          </button>
+          <div style={{ flex: 1 }} />
+          {activeRowsResult && (
+            <div className="result-view-actions">
+              <button
+                type="button"
+                className="result-action-btn"
+                onClick={() => onExportActiveResult('csv')}
+                title="导出当前结果为 CSV"
+              >
+                CSV
+              </button>
+              <button
+                type="button"
+                className="result-action-btn"
+                onClick={() => onExportActiveResult('json')}
+                title="导出当前结果为 JSON"
+              >
+                JSON
+              </button>
+            </div>
+          )}
+          {durationMs > 0 && (
+            <span style={{ fontSize: 11, color: '#888', padding: '0 8px', alignSelf: 'center' }}>运行时间: {(durationMs / 1000).toFixed(3)}s</span>
+          )}
+        </div>
+      )}
+      <div className="result-grid-wrap">
+        {results.length === 0 ? (
+          <div className="empty-state" style={{ padding: 40 }}>
+            <span style={{ fontSize: 13, color: '#aaa' }}>运行查询以查看结果</span>
+          </div>
+        ) : activeResultIndex === -1 ? (
+          <div className="query-messages">
+            {results.map((r, i) => (
+              <div key={i} className="query-message-item">
+                {r.kind === 'rows' ? (
+                  <>
+                    <div className="qm-sql">{r.title}</div>
+                    <div className="qm-info">&gt; {r.rows.length} 条记录</div>
+                    <div className="qm-time">&gt; Time: {(durationMs / 1000 / results.length).toFixed(3)}s</div>
+                  </>
+                ) : r.kind === 'mutation' ? (
+                  <>
+                    <div className="qm-sql">{r.title}</div>
+                    <div className="qm-info">&gt; Affected rows: {r.affectedRows}</div>
+                    <div className="qm-time">&gt; Time: {(durationMs / 1000 / results.length).toFixed(3)}s</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="qm-sql">{r.title}</div>
+                    <div className="qm-info">&gt; {r.message}</div>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : activeResultIndex === -2 ? (
+          <table className="data-grid">
+            <thead>
+              <tr>
+                <th>Query</th>
+                <th>Message</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((r, i) => (
+                <tr key={i}>
+                  <td style={{ maxWidth: 400 }}>{r.title}</td>
+                  <td>
+                    {r.kind === 'rows' ? `${r.rows.length} 条记录` : r.kind === 'mutation' ? `Affected rows: ${r.affectedRows}` : r.message}
+                  </td>
+                  <td>{(durationMs / 1000 / results.length).toFixed(6)}s</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : activeResult?.kind === 'rows' ? (
+          <VirtualQueryGrid
+            columns={activeResult.columns}
+            rows={activeResult.rows}
+          />
+        ) : activeResult?.kind === 'mutation' ? (
+          <div className="query-messages">
+            <div className="query-message-item">
+              <div className="qm-sql">{activeResult.title}</div>
+              <div className="qm-info">&gt; Affected rows: {activeResult.affectedRows}</div>
+              <div className="qm-time">&gt; Time: {(durationMs / 1000).toFixed(3)}s</div>
+            </div>
+          </div>
+        ) : (
+          <div className="empty-state" style={{ padding: 40 }}>
+            <span style={{ fontSize: 13, color: '#aaa' }}>无结果</span>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}, (prev, next) => (
+  prev.results === next.results &&
+  prev.activeResultIndex === next.activeResultIndex &&
+  prev.durationMs === next.durationMs
+))
+
+type QueryTabPaneProps = {
+  tab: QueryTab
+  schemas: SchemaNode[]
+  history: string[]
+  querySnippets: QuerySnippet[]
+  flash: (tone: 'success' | 'error', message: string) => void
+  onPersistSql: (tabId: string, sql: string) => void
+  onChangeSchema: (tabId: string, schemaName: string) => void
+  onRunQuery: (tabId: string, sql?: string) => void
+  onCancelRunningQuery: (tabId: string, activeQueryId?: string) => void
+  onSaveSnippet: (tab: QueryTab, sql: string) => void
+  onClearHistory: () => void
+  onSetActiveResult: (tabId: string, index: number) => void
+}
+
+const QueryTabPane = memo(function QueryTabPane({
+  tab,
+  schemas,
+  history,
+  querySnippets,
+  flash,
+  onPersistSql,
+  onChangeSchema,
+  onRunQuery,
+  onCancelRunningQuery,
+  onSaveSnippet,
+  onClearHistory,
+  onSetActiveResult,
+}: QueryTabPaneProps) {
+  const sqlEditorRef = useRef<SqlEditorHandle>(null)
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false)
+  const draftSqlRef = useRef(tab.sql)
+  const persistedSqlRef = useRef(tab.sql)
+  const persistSqlRef = useRef(onPersistSql)
+  const activeResult = tab.results[tab.activeResultIndex] ?? null
+  const activeRowsResult = activeResult?.kind === 'rows' ? activeResult : null
+  const matchingSnippets = querySnippets
+    .filter((snippet) =>
+      (!snippet.connectionId || snippet.connectionId === tab.connectionId) &&
+      (!snippet.schemaName || snippet.schemaName === tab.schemaName),
+    )
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+
+  useEffect(() => {
+    persistedSqlRef.current = tab.sql
+  }, [tab.sql])
+
+  useEffect(() => {
+    persistSqlRef.current = onPersistSql
+  }, [onPersistSql])
+
+  const commitDraftSql = useCallback((sql = draftSqlRef.current) => {
+    if (sql === persistedSqlRef.current) {
+      return
+    }
+    persistedSqlRef.current = sql
+    persistSqlRef.current(tab.id, sql)
+  }, [tab.id])
+
+  function handleEditorChange(sql: string) {
+    draftSqlRef.current = sql
+  }
+
+  useEffect(() => () => {
+    commitDraftSql()
+  }, [commitDraftSql])
+
+  function applyEditorSql(sql: string) {
+    draftSqlRef.current = sql
+    sqlEditorRef.current?.setValue(sql)
+    commitDraftSql(sql)
+  }
+
+  function runActiveSql() {
+    commitDraftSql()
+    const sql = sqlEditorRef.current?.getRunnableSql().trim() ?? ''
+    onRunQuery(tab.id, sql || draftSqlRef.current)
+  }
+
+  function runAllSql() {
+    commitDraftSql()
+    onRunQuery(tab.id, draftSqlRef.current)
+  }
+
+  function exportActiveResult(format: 'csv' | 'json') {
+    if (!activeRowsResult) return
+
+    if (format === 'json') {
+      const payload = activeRowsResult.rows.map((row) => Object.fromEntries(
+        activeRowsResult.columns.map((column) => [column, row[column] ?? null]),
+      ))
+      downloadTextFile(
+        buildResultFileName(tab.schemaName, tab.activeResultIndex, 'json'),
+        `${JSON.stringify(payload, null, 2)}\n`,
+        'application/json;charset=utf-8',
+      )
+      flash('success', `已导出 ${activeRowsResult.rows.length} 行 JSON`)
+      return
+    }
+
+    const csvLines = [
+      activeRowsResult.columns.map((column) => escapeCsvValue(column)).join(','),
+      ...activeRowsResult.rows.map((row) =>
+        activeRowsResult.columns.map((column) => escapeCsvValue(row[column])).join(','),
+      ),
+    ]
+    downloadTextFile(
+      buildResultFileName(tab.schemaName, tab.activeResultIndex, 'csv'),
+      `${csvLines.join('\n')}\n`,
+      'text/csv;charset=utf-8',
+    )
+    flash('success', `已导出 ${activeRowsResult.rows.length} 行 CSV`)
+  }
+
+  return (
+    <div className="query-pane">
+      <div className="query-toolbar">
+        <button
+          className="run-btn"
+          disabled={tab.loading}
+          onClick={runActiveSql}
+          title="运行当前语句，或已选中的 SQL"
+        >
+          {tab.loading ? '⏳ 执行中...' : '▶ 运行'}
+        </button>
+        <button
+          className="run-btn"
+          disabled={!tab.loading || !tab.activeQueryId}
+          onClick={() => onCancelRunningQuery(tab.id, tab.activeQueryId)}
+        >
+          ■ 停止
+        </button>
+        <div className="query-db-selector">
+          <span className="db-selector-icon">📦</span>
+          <select
+            value={tab.schemaName}
+            onChange={e => onChangeSchema(tab.id, e.target.value)}
+          >
+            <option value="">-- 选择数据库 --</option>
+            {schemas.map(s => (
+              <option key={s.name} value={s.name}>{s.name}</option>
+            ))}
+          </select>
+        </div>
+        <select
+          className="query-snippet-select"
+          value=""
+          onChange={e => {
+            const snippet = matchingSnippets.find(item => item.id === e.target.value)
+            if (!snippet) return
+            applyEditorSql(snippet.sql)
+          }}
+          title="加载 SQL 片段"
+        >
+          <option value="">片段</option>
+          {matchingSnippets.map(snippet => (
+            <option key={snippet.id} value={snippet.id}>{snippet.name}</option>
+          ))}
+        </select>
+
+        <button className="action-btn" onClick={() => onSaveSnippet(tab, draftSqlRef.current)} title="保存为 SQL 片段">💾</button>
+        <div style={{ position: 'relative' }}>
+          <button className="action-btn" onClick={() => setShowHistoryPanel(prev => !prev)} title="执行历史">🕘</button>
+          {showHistoryPanel && (
+            <div className="history-panel">
+              <div className="history-panel-header">
+                <span>执行历史 ({history.length})</span>
+                <button onClick={() => { onClearHistory(); setShowHistoryPanel(false) }} title="清空历史">🗑️</button>
+              </div>
+              {history.length === 0 ? (
+                <div className="history-empty">暂无历史记录</div>
+              ) : (
+                <div className="history-list">
+                  {history.map((sql, i) => (
+                    <div
+                      key={i}
+                      className="history-item"
+                      onClick={() => {
+                        applyEditorSql(sql)
+                        setShowHistoryPanel(false)
+                      }}
+                      title={sql}
+                    >
+                      <code>{sql.length > 120 ? `${sql.slice(0, 120)}...` : sql}</code>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+      <div
+        className="query-split-container"
+        ref={el => {
+          if (!el) return
+          const container = el
+          if (el.dataset.splitInit) return
+          el.dataset.splitInit = 'true'
+          const editorArea = el.querySelector('.query-editor-area') as HTMLElement
+          const handle = el.querySelector('.query-split-handle') as HTMLElement
+          if (!editorArea || !handle) return
+
+          let startY = 0
+          let startH = 0
+          const heightUpdater = createRafUpdater<number>((height) => {
+            editorArea.style.height = `${height}px`
+            editorArea.style.flex = 'none'
+          })
+
+          function onMouseMove(e: MouseEvent) {
+            const delta = e.clientY - startY
+            const newH = Math.max(60, Math.min(startH + delta, container.clientHeight - 80))
+            heightUpdater.schedule(newH)
+          }
+
+          function onMouseUp() {
+            heightUpdater.flush()
+            document.removeEventListener('mousemove', onMouseMove)
+            document.removeEventListener('mouseup', onMouseUp)
+            document.body.style.userSelect = ''
+            document.body.style.cursor = ''
+          }
+
+          handle.addEventListener('mousedown', (e: MouseEvent) => {
+            e.preventDefault()
+            startY = e.clientY
+            startH = editorArea.offsetHeight
+            document.body.style.userSelect = 'none'
+            document.body.style.cursor = 'row-resize'
+            document.addEventListener('mousemove', onMouseMove)
+            document.addEventListener('mouseup', onMouseUp)
+          })
+        }}
+      >
+        <div className="query-editor-area">
+          <SqlEditor
+            ref={sqlEditorRef}
+            value={tab.sql}
+            onChange={handleEditorChange}
+            onRun={runAllSql}
+            onRunSelection={selectedSql => onRunQuery(tab.id, selectedSql)}
+            schemas={schemas}
+            currentSchema={tab.schemaName}
+            suppressExternalValueSync
+          />
+        </div>
+        <div className="query-split-handle" title="拖拽调整大小" />
+        <QueryResultsPane
+          results={tab.results}
+          activeResultIndex={tab.activeResultIndex}
+          durationMs={tab.durationMs}
+          onSetActiveResult={(index) => onSetActiveResult(tab.id, index)}
+          onExportActiveResult={exportActiveResult}
+        />
+      </div>
+    </div>
+  )
+}, (prev, next) => (
+  prev.tab === next.tab &&
+  prev.schemas === next.schemas &&
+  prev.history === next.history &&
+  prev.querySnippets === next.querySnippets
+))
+
+type DesignTabWrapperProps = {
+  tab: DesignTab
+  profile: ConnectionProfile
+  onSuccess: (message: string) => void
+  onError: (message: string) => void
+  onCancel: () => void
+}
+
+function mapColumnToDesignerColumn(column: TableColumn): ColumnDef {
+  const typeMatch = /^([A-Z]+)(?:\(([^)]+)\))?/i.exec(column.type)
+  return {
+    name: column.name,
+    type: (typeMatch?.[1] ?? column.type).toUpperCase(),
+    length: typeMatch?.[2] ?? '',
+    notNull: !column.nullable,
+    isPK: column.key === 'PRI',
+    autoIncrement: (column.extra ?? '').toLowerCase().includes('auto_increment'),
+    defaultValue: column.defaultValue ?? '',
+    comment: column.comment ?? '',
+  }
+}
+
+function splitSqlStatements(sql: string) {
+  return sql
+    .split(/;\s*(?:\n|$)/)
+    .map((statement) => statement.trim())
+    .filter(Boolean)
+}
+
+function DesignTabWrapper({
+  tab,
+  profile,
+  onSuccess,
+  onError,
+  onCancel,
+}: DesignTabWrapperProps) {
+  const [initialColumns, setInitialColumns] = useState<ColumnDef[] | null>(tab.mode === 'create' ? [] : null)
+  const onErrorRef = useRef(onError)
+
+  useEffect(() => {
+    onErrorRef.current = onError
+  }, [onError])
+
+  useEffect(() => {
+    if (tab.mode === 'create') {
+      return
+    }
+
+    let cancelled = false
+
+    void (async () => {
+      try {
+        const response = await api.fetchTableColumns(profile, tab.schemaName, tab.tableName)
+        if (cancelled) return
+        setInitialColumns(response.columns.map(mapColumnToDesignerColumn))
+      } catch (err) {
+        if (cancelled) return
+        onErrorRef.current(`读取表结构失败: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [profile, tab.id, tab.mode, tab.schemaName, tab.tableName])
+
+  if (tab.mode === 'alter' && initialColumns === null) {
+    return (
+      <div className="empty-state">
+        <span className="empty-title">正在加载表结构...</span>
+      </div>
+    )
+  }
+
+  return (
+    <TableDesigner
+      initialColumns={initialColumns ?? []}
+      tableName={tab.tableName}
+      schemaName={tab.schemaName}
+      mode={tab.mode}
+      onExecute={(sql) => {
+        const statements = splitSqlStatements(sql)
+        if (statements.length === 0) {
+          onError('没有可执行的 SQL')
+          return
+        }
+
+        void (async () => {
+          try {
+            await api.runStatements(profile, statements, tab.schemaName, true)
+            onSuccess(tab.mode === 'create' ? `已创建表 ${tab.tableName}` : `已更新表 ${tab.tableName}`)
+          } catch (err) {
+            onError(`执行失败: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        })()
+      }}
+      onCancel={onCancel}
+    />
+  )
+}
+
+/* ═══════════════════════════════════════════════
    App
    ═══════════════════════════════════════════════ */
 
@@ -163,9 +948,32 @@ export default function App() {
   /* ── Persisted state ────────────────────────── */
   const [profiles, setProfiles] = useState<ConnectionProfile[]>(() => readStorage(STORAGE_PROFILES, []))
   const [history, setHistory] = useState<string[]>(() => readStorage(STORAGE_HISTORY, []))
+  const [querySnippets, setQuerySnippets] = useState<QuerySnippet[]>(() => readStorage(STORAGE_QUERY_SNIPPETS, []))
+
+
+  useEffect(() => {
+    const clearDragState = () => {
+      document.body.style.userSelect = ''
+      document.body.style.cursor = ''
+    }
+
+    window.addEventListener('mouseup', clearDragState)
+    window.addEventListener('pointerup', clearDragState)
+    window.addEventListener('dragend', clearDragState)
+    window.addEventListener('blur', clearDragState)
+
+    return () => {
+      window.removeEventListener('mouseup', clearDragState)
+      window.removeEventListener('pointerup', clearDragState)
+      window.removeEventListener('dragend', clearDragState)
+      window.removeEventListener('blur', clearDragState)
+    }
+  }, [])
 
   useEffect(() => { writeStorage(STORAGE_PROFILES, profiles) }, [profiles])
   useEffect(() => { writeStorage(STORAGE_HISTORY, history) }, [history])
+  useEffect(() => { writeStorage(STORAGE_QUERY_SNIPPETS, querySnippets) }, [querySnippets])
+
 
   /* ── Connection state ───────────────────────── */
   const [liveConnections, setLiveConnections] = useState<Map<string, { profile: ConnectionProfile; schemas: SchemaNode[]; version: string }>>(new Map())
@@ -174,8 +982,12 @@ export default function App() {
   const [treeFilter, setTreeFilter] = useState('')
 
   /* ── Tab state ──────────────────────────────── */
-  const [tabs, setTabs] = useState<AppTab[]>([])
-  const [activeTabId, setActiveTabId] = useState<string | null>(null)
+  const [tabs, setTabs] = useState<AppTab[]>(() => readPersistedQueryTabs())
+  const [activeTabId, setActiveTabId] = useState<string | null>(() => {
+    const restoredTabs = readPersistedQueryTabs()
+    const savedActive = localStorage.getItem(STORAGE_ACTIVE_QUERY_TAB)
+    return restoredTabs.find(tab => tab.id === savedActive)?.id ?? restoredTabs[0]?.id ?? null
+  })
 
   /* ── Column cache ───────────────────────────── */
   const [columnCache, setColumnCache] = useState<Record<string, TableColumn[]>>({})
@@ -186,8 +998,11 @@ export default function App() {
   /* ── Table stats cache ─────────────────────── */
   const [tableStatsCache, setTableStatsCache] = useState<Record<string, Record<string, unknown>>>({})
 
+  /* ── Table metadata cache ──────────────────── */
+  const [tableMetaCache, setTableMetaCache] = useState<Record<string, { indexes: TableIndex[]; foreignKeys: TableForeignKey[] }>>({})
+
   /* ── Info panel tab ────────────────────────── */
-  const [infoPanelTab, setInfoPanelTab] = useState<'info' | 'ddl' | 'columns'>('info')
+  const [infoPanelTab, setInfoPanelTab] = useState<'info' | 'ddl' | 'columns' | 'indexes' | 'foreignKeys'>('info')
 
   /* ── Panel visibility ────────────────────── */
   const [showSidebar, setShowSidebar] = useState(true)
@@ -235,11 +1050,22 @@ export default function App() {
   const [notice, setNotice] = useState<{ tone: 'success' | 'error'; message: string } | null>(null)
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
-  function flash(tone: 'success' | 'error', message: string) {
+  const tabsRef = useRef(tabs)
+  const liveConnectionsRef = useRef(liveConnections)
+
+  useEffect(() => {
+    tabsRef.current = tabs
+  }, [tabs])
+
+  useEffect(() => {
+    liveConnectionsRef.current = liveConnections
+  }, [liveConnections])
+
+  const flash = useCallback((tone: 'success' | 'error', message: string) => {
     setNotice({ tone, message })
     clearTimeout(noticeTimer.current)
     noticeTimer.current = setTimeout(() => setNotice(null), 4000)
-  }
+  }, [])
 
   /* ── NCX Import/Export modal ─────────────────── */
   const ncxFileInputRef = useRef<HTMLInputElement>(null)
@@ -387,8 +1213,9 @@ export default function App() {
         const blob = new Blob([lines.join('\n')], { type: 'application/xml' })
 
         // Try native save dialog first, fallback to download link
-        if ('showSaveFilePicker' in window) {
-          const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
+        const pickerWindow = window as SavePickerWindow
+        if (pickerWindow.showSaveFilePicker) {
+          const handle = await pickerWindow.showSaveFilePicker({
             suggestedName: 'connections.ncx',
             types: [{ description: 'Navicat Connection Export', accept: { 'application/xml': ['.ncx'] } }],
           })
@@ -417,13 +1244,24 @@ export default function App() {
   type ContextMenuItem = { icon: string; label: string; shortcut?: string; action: () => void; danger?: boolean; disabled?: boolean; children?: ContextMenuItem[] } | 'separator'
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
 
+  const ctxMenuRef = useCallback((node: HTMLDivElement | null) => {
+    if (!node || !ctxMenu) return
+    const rect = node.getBoundingClientRect()
+    const pad = 8
+    let { x, y } = ctxMenu
+    if (rect.right > window.innerWidth - pad) x = window.innerWidth - rect.width - pad
+    if (rect.bottom > window.innerHeight - pad) y = window.innerHeight - rect.height - pad
+    if (x < pad) x = pad
+    if (y < pad) y = pad
+    if (x !== ctxMenu.x || y !== ctxMenu.y) {
+      setCtxMenu({ ...ctxMenu, x, y })
+    }
+  }, [ctxMenu])
+
   function showContextMenu(e: React.MouseEvent, items: ContextMenuItem[]) {
     e.preventDefault()
     e.stopPropagation()
-    // Adjust position to keep menu on screen
-    const x = Math.min(e.clientX, window.innerWidth - 220)
-    const y = Math.min(e.clientY, window.innerHeight - 300)
-    setCtxMenu({ x, y, items })
+    setCtxMenu({ x: e.clientX, y: e.clientY, items })
   }
 
   function closeContextMenu() { setCtxMenu(null); setColSortMenu(null) }
@@ -487,6 +1325,22 @@ export default function App() {
       'separator',
       { icon: '📝', label: '新建查询', shortcut: '⌘Y', action: () => { closeContextMenu(); openQueryTab(connectionId, schemaName) } },
       { icon: '💻', label: '命令列界面', action: () => { closeContextMenu(); openCliTab(connectionId, schemaName) } },
+      { icon: '📊', label: '新建表...', action: () => {
+        closeContextMenu()
+        const tableName = prompt('输入新表名:')
+        if (!tableName?.trim()) return
+        const tab: DesignTab = {
+          id: crypto.randomUUID(),
+          kind: 'design',
+          title: `设计: ${tableName.trim()}`,
+          connectionId,
+          schemaName,
+          tableName: tableName.trim(),
+          mode: 'create',
+        }
+        setTabs(prev => [...prev, tab])
+        setActiveTabId(tab.id)
+      } },
       { icon: '📄', label: '运行 SQL 文件...', action: () => {
         closeContextMenu()
         const conn = liveConnections.get(connectionId)
@@ -614,9 +1468,10 @@ export default function App() {
       // Now ask user for save location
       const defaultName = `${schemaName}.sql`
       let fileHandle: FileSystemFileHandle | null = null
+      const pickerWindow = window as SavePickerWindow
       try {
-        if ('showSaveFilePicker' in window) {
-          fileHandle = await (window as any).showSaveFilePicker({
+        if (pickerWindow.showSaveFilePicker) {
+          fileHandle = await pickerWindow.showSaveFilePicker({
             suggestedName: defaultName,
             types: [{
               description: 'SQL Files',
@@ -624,8 +1479,8 @@ export default function App() {
             }],
           })
         }
-      } catch (e: any) {
-        if (e?.name === 'AbortError') return
+      } catch (e: unknown) {
+        if (e instanceof DOMException && e.name === 'AbortError') return
         // fallback to auto download
       }
 
@@ -713,15 +1568,16 @@ export default function App() {
       // Save
       const defaultName = `${tableName}.sql`
       let fileHandle: FileSystemFileHandle | null = null
+      const pickerWindow = window as SavePickerWindow
       try {
-        if ('showSaveFilePicker' in window) {
-          fileHandle = await (window as any).showSaveFilePicker({
+        if (pickerWindow.showSaveFilePicker) {
+          fileHandle = await pickerWindow.showSaveFilePicker({
             suggestedName: defaultName,
             types: [{ description: 'SQL Files', accept: { 'text/sql': ['.sql'] } }],
           })
         }
-      } catch (e: any) {
-        if (e?.name === 'AbortError') return
+      } catch (e: unknown) {
+        if (e instanceof DOMException && e.name === 'AbortError') return
       }
 
       if (fileHandle) {
@@ -764,6 +1620,20 @@ export default function App() {
           setActiveTabId(tab.id)
           setTimeout(() => void runQuery(tab.id), 100)
         }
+      } },
+      { icon: '🔧', label: '修改表结构...', action: () => {
+        closeContextMenu()
+        const tab: DesignTab = {
+          id: crypto.randomUUID(),
+          kind: 'design',
+          title: `设计: ${tableName}`,
+          connectionId,
+          schemaName,
+          tableName,
+          mode: 'alter',
+        }
+        setTabs(prev => [...prev, tab])
+        setActiveTabId(tab.id)
       } },
       'separator',
       { icon: '🗑️', label: '删除表', danger: true, action: () => {
@@ -1014,7 +1884,11 @@ export default function App() {
       columns: [],
       rows: [],
       page: 1,
+      pageCursors: [null],
+      pagingMode: 'offset',
       totalRows: 0,
+      hasMore: false,
+      rowCountExact: false,
       loading: true,
     }
     // Reset filter state for the new tab
@@ -1030,11 +1904,12 @@ export default function App() {
     setSelectedNode({ kind: 'table', connectionId, schemaName, tableName })
     void ensureColumns(connectionId, schemaName, tableName)
     void fetchTableStats(conn.profile, schemaName, tableName)
+    void fetchTableMetadata(conn.profile, schemaName, tableName)
 
     await loadDataPage(tabId, conn.profile, schemaName, tableName, 1)
 
     // Also fetch & cache the DDL
-    fetchDdl(conn.profile, schemaName, tableName)
+    void fetchDdl(conn.profile, schemaName, tableName)
   }
 
   async function loadDataPage(tabId: string, profile: ConnectionProfile, schemaName: string, tableName: string, page: number, whereOverride?: string, orderOverride?: { col: string; dir: 'ASC' | 'DESC' } | null) {
@@ -1044,33 +1919,29 @@ export default function App() {
       const effectiveWhere = whereOverride !== undefined ? whereOverride : filterWhere
       const whereClause = effectiveWhere ? ` WHERE ${effectiveWhere}` : ''
 
-      // Count total rows
-      const countSql = `SELECT COUNT(*) AS cnt FROM ${q(schemaName)}.${q(tableName)}${whereClause};`
-      const countResp = await api.runQuery(profile, countSql, schemaName)
-      let totalRows = 0
-      const countResult = countResp.results[0]
-      if (countResult?.kind === 'rows' && countResult.rows.length > 0) {
-        totalRows = Number(countResult.rows[0].cnt ?? 0)
-      }
-
       // Fetch page data — use override if provided (avoids stale closure)
       const effectiveOrder = orderOverride !== undefined ? orderOverride : orderBy
       const offset = (page - 1) * PAGE_SIZE
       const orderClause = effectiveOrder ? ` ORDER BY \`${effectiveOrder.col}\` ${effectiveOrder.dir}` : ''
-      const dataSql = `SELECT * FROM ${q(schemaName)}.${q(tableName)}${whereClause}${orderClause} LIMIT ${PAGE_SIZE} OFFSET ${offset};`
+      // Fetch one extra row to know if there's a next page
+      const dataSql = `SELECT * FROM ${q(schemaName)}.${q(tableName)}${whereClause}${orderClause} LIMIT ${PAGE_SIZE + 1} OFFSET ${offset};`
       const dataResp = await api.runQuery(profile, dataSql, schemaName)
       const dataResult = dataResp.results[0]
 
       if (dataResult?.kind === 'rows') {
+        const hasMore = dataResult.rows.length > PAGE_SIZE
+        const rows = hasMore ? dataResult.rows.slice(0, PAGE_SIZE) : dataResult.rows
         updateTab<DataTab>(tabId, {
           columns: dataResult.columns,
-          rows: dataResult.rows,
+          rows,
           page,
-          totalRows,
+          hasMore,
+          totalRows: offset + rows.length + (hasMore ? 1 : 0),
+          rowCountExact: false,
           loading: false,
         })
       } else {
-        updateTab<DataTab>(tabId, { page, totalRows, loading: false })
+        updateTab<DataTab>(tabId, { page, hasMore: false, loading: false })
       }
     } catch (err) {
       flash('error', err instanceof Error ? err.message : '加载数据失败')
@@ -1123,39 +1994,112 @@ export default function App() {
     })
   }
 
-  function updateTab<T extends AppTab>(tabId: string, patch: Partial<T>) {
+  const updateTab = useCallback(<T extends AppTab>(tabId: string, patch: Partial<T>) => {
     setTabs(prev => prev.map(t => t.id === tabId ? { ...t, ...patch } : t))
-  }
+  }, [])
+
+  const persistQuerySql = useCallback((tabId: string, sql: string) => {
+    setTabs(prev => prev.map(tab =>
+      tab.id === tabId && tab.kind === 'query'
+        ? { ...tab, sql }
+        : tab,
+    ))
+  }, [])
+
+  const changeQuerySchema = useCallback((tabId: string, schemaName: string) => {
+    setTabs(prev => prev.map(tab =>
+      tab.id === tabId && tab.kind === 'query'
+        ? { ...tab, schemaName, title: `无标题 @${schemaName}` }
+        : tab,
+    ))
+  }, [])
+
+  const setQueryActiveResult = useCallback((tabId: string, index: number) => {
+    startTransition(() => {
+      setTabs(prev => prev.map(tab =>
+        tab.id === tabId && tab.kind === 'query'
+          ? { ...tab, activeResultIndex: index }
+          : tab,
+      ))
+    })
+  }, [])
+
+  const clearQueryHistory = useCallback(() => {
+    setHistory([])
+  }, [])
+
+  const saveSnippet = useCallback((tab: QueryTab, sqlText = tab.sql) => {
+    const sql = sqlText.trim()
+    if (!sql) {
+      flash('error', '没有可保存的 SQL')
+      return
+    }
+
+    const defaultName = tab.title.startsWith('无标题') ? `SQL ${new Date().toLocaleString()}` : tab.title
+    const name = prompt('片段名称', defaultName)?.trim()
+    if (!name) return
+
+    const snippet: QuerySnippet = {
+      id: crypto.randomUUID(),
+      name,
+      sql,
+      connectionId: tab.connectionId,
+      schemaName: tab.schemaName,
+      updatedAt: Date.now(),
+    }
+
+    setQuerySnippets((prev) => [snippet, ...prev.filter((item) => item.name !== name)].slice(0, 100))
+    flash('success', `已保存片段 "${name}"`)
+  }, [flash])
+
+  const cancelRunningQuery = useCallback(async (tabId: string, activeQueryId?: string) => {
+    if (!activeQueryId) return
+    try {
+      await api.cancelQuery(activeQueryId)
+      updateTab<QueryTab>(tabId, { loading: false, activeQueryId: undefined })
+      flash('success', '已发送停止请求')
+    } catch (err) {
+      flash('error', err instanceof Error ? err.message : '停止 SQL 失败')
+    }
+  }, [flash, updateTab])
 
   /* ═══════════════════════════════════════════════
      Query execution
      ═══════════════════════════════════════════════ */
 
-  async function runQuery(tabId: string) {
-    const tab = tabs.find(t => t.id === tabId) as QueryTab | undefined
+  const runQuery = useCallback(async (tabId: string, overrideSql?: string) => {
+    const tab = tabsRef.current.find(t => t.id === tabId) as QueryTab | undefined
     if (!tab || tab.kind !== 'query') return
-    const conn = liveConnections.get(tab.connectionId)
+    const conn = liveConnectionsRef.current.get(tab.connectionId)
     if (!conn) { flash('error', '未连接'); return }
-    const sql = tab.sql.trim()
+    const sql = (overrideSql ?? tab.sql).trim()
     if (!sql) { flash('error', 'SQL 为空'); return }
+    const queryId = crypto.randomUUID()
 
-    updateTab(tabId, { loading: true })
+    updateTab<QueryTab>(tabId, { loading: true, activeQueryId: queryId })
 
     try {
-      const response = await api.runQuery(conn.profile, sql, tab.schemaName || undefined)
-      updateTab<QueryTab>(tabId, {
-        results: response.results,
-        activeResultIndex: 0,
-        durationMs: response.durationMs,
-        loading: false,
+      const response = await api.runQuery(conn.profile, sql, tab.schemaName || undefined, queryId)
+      startTransition(() => {
+        updateTab<QueryTab>(tabId, {
+          results: response.results,
+          activeResultIndex: 0,
+          durationMs: response.durationMs,
+          activeQueryId: undefined,
+          loading: false,
+        })
       })
       setHistory(prev => [sql, ...prev.filter(h => h !== sql)].slice(0, 50))
       flash('success', `执行完成 — ${response.results.length} 个结果集，耗时 ${response.durationMs}ms`)
     } catch (err) {
-      flash('error', err instanceof Error ? err.message : 'SQL 执行失败')
-      updateTab(tabId, { loading: false })
+      if (isQueryCancelledMessage(err)) {
+        flash('success', 'SQL 已停止')
+      } else {
+        flash('error', err instanceof Error ? err.message : 'SQL 执行失败')
+      }
+      updateTab<QueryTab>(tabId, { loading: false, activeQueryId: undefined })
     }
-  }
+  }, [flash, updateTab])
 
   /* ═══════════════════════════════════════════════
      DDL fetch
@@ -1196,6 +2140,17 @@ export default function App() {
     }
   }
 
+  async function fetchTableMetadata(profile: ConnectionProfile, schemaName: string, tableName: string) {
+    const key = `${profile.id}:${schemaName}.${tableName}`
+    if (tableMetaCache[key]) return
+    try {
+      const metadata = await api.fetchTableMetadata(profile, schemaName, tableName)
+      setTableMetaCache(prev => ({ ...prev, [key]: metadata }))
+    } catch {
+      // ignore
+    }
+  }
+
   /* ═══════════════════════════════════════════════
      Column cache
      ═══════════════════════════════════════════════ */
@@ -1218,6 +2173,32 @@ export default function App() {
      ═══════════════════════════════════════════════ */
 
   const activeTab = tabs.find(t => t.id === activeTabId) ?? null
+  const queryTabsPersistTimer = useRef<number | undefined>(undefined)
+
+  useEffect(() => {
+    window.clearTimeout(queryTabsPersistTimer.current)
+    queryTabsPersistTimer.current = window.setTimeout(() => {
+      const persistedTabs = tabs
+        .filter((tab): tab is QueryTab => tab.kind === 'query')
+        .map((tab) => ({
+          id: tab.id,
+          title: tab.title,
+          connectionId: tab.connectionId,
+          schemaName: tab.schemaName,
+          sql: tab.sql,
+        }))
+      writeStorage(STORAGE_QUERY_TABS, persistedTabs)
+    }, 320)
+
+    return () => {
+      window.clearTimeout(queryTabsPersistTimer.current)
+    }
+  }, [tabs])
+
+  useEffect(() => {
+    const queryTab = activeTab?.kind === 'query' ? activeTab.id : ''
+    localStorage.setItem(STORAGE_ACTIVE_QUERY_TAB, queryTab)
+  }, [activeTab])
 
   // Info panel data
   const infoPanelContent = useMemo(() => {
@@ -1258,11 +2239,12 @@ export default function App() {
         tableName: selectedNode.tableName,
         ddl: ddlCache[ddlKey] ?? null,
         columns: columnCache[ddlKey] ?? null,
+        metadata: tableMetaCache[ddlKey] ?? null,
       }
     }
 
     return null
-  }, [selectedNode, liveConnections, profiles, ddlCache, columnCache])
+  }, [selectedNode, liveConnections, profiles, ddlCache, columnCache, tableMetaCache])
 
   /* ═══════════════════════════════════════════════
      Renderers
@@ -1360,6 +2342,7 @@ export default function App() {
                                   if (conn) {
                                     void fetchDdl(conn.profile, schema.name, table.name)
                                     void fetchTableStats(conn.profile, schema.name, table.name)
+                                    void fetchTableMetadata(conn.profile, schema.name, table.name)
                                   }
                                 }}
                                 onDoubleClick={() => {
@@ -1465,12 +2448,16 @@ export default function App() {
     if (!table) return
     const startX = e.clientX
     const startW = th.offsetWidth
+    const widthUpdater = createRafUpdater<number>((width) => {
+      th.style.width = `${width}px`
+      th.style.minWidth = `${width}px`
+    })
     function onMove(ev: MouseEvent) {
       const w = Math.max(40, startW + ev.clientX - startX)
-      th.style.width = `${w}px`
-      th.style.minWidth = `${w}px`
+      widthUpdater.schedule(w)
     }
     function onUp() {
+      widthUpdater.flush()
       document.removeEventListener('mousemove', onMove)
       document.removeEventListener('mouseup', onUp)
       document.body.style.userSelect = ''
@@ -1487,7 +2474,6 @@ export default function App() {
       return <div className="empty-state"><span className="empty-title">加载中...</span></div>
     }
 
-    const totalPages = Math.max(1, Math.ceil(tab.totalRows / PAGE_SIZE))
     const rowOffset = (tab.page - 1) * PAGE_SIZE
 
     function goToPage(page: number, whereOverride?: string, orderOverride?: { col: string; dir: 'ASC' | 'DESC' } | null) {
@@ -1744,9 +2730,7 @@ export default function App() {
       if (sqls.length === 0) { flash('error', '没有待提交的修改'); return }
 
       try {
-        for (const sql of sqls) {
-          await api.runQuery(conn.profile, sql, tab.schemaName)
-        }
+        await api.runStatements(conn.profile, sqls, tab.schemaName, true)
         flash('success', `成功执行 ${sqls.length} 条 SQL`)
         discardChanges()
         goToPage(tab.page) // refresh
@@ -2306,34 +3290,28 @@ export default function App() {
                   }}
                   onKeyDown={e => {
                     if (e.key === 'Enter') {
-                      const p = Math.max(1, Math.min(tab.page, totalPages))
+                      const p = Math.max(1, tab.page)
                       goToPage(p)
                     }
                   }}
                   onBlur={() => {
-                    const p = Math.max(1, Math.min(tab.page, totalPages))
+                    const p = Math.max(1, tab.page)
                     if (p !== tab.page) {
                       updateTab<DataTab>(tab.id, { page: p })
                     }
                     goToPage(p)
                   }}
                 />
-                / {totalPages} 页
+                页
               </span>
               <button
                 className="page-btn"
-                disabled={tab.page >= totalPages}
+                disabled={!tab.hasMore}
                 onClick={() => goToPage(tab.page + 1)}
                 title="下一页"
               >▶</button>
-              <button
-                className="page-btn"
-                disabled={tab.page >= totalPages}
-                onClick={() => goToPage(totalPages)}
-                title="末页"
-              >⏭</button>
             </div>
-            <span className="page-count">{tab.rows.length} 条记录 / 共 {tab.totalRows.toLocaleString()} 条</span>
+            <span className="page-count">{tab.rows.length} 条记录{tab.hasMore ? '+' : ''}</span>
           </div>
         </div>
       </div>
@@ -2342,210 +3320,25 @@ export default function App() {
 
   /* ── Query tab content ──────────────────────── */
   function renderQueryTab(tab: QueryTab) {
-    const activeResult = tab.results[tab.activeResultIndex] ?? null
     const conn = liveConnections.get(tab.connectionId)
     const schemas = conn?.schemas ?? []
 
     return (
-      <div className="query-pane">
-        <div className="query-toolbar">
-          <button
-            className="run-btn"
-            disabled={tab.loading}
-            onClick={() => void runQuery(tab.id)}
-          >
-            {tab.loading ? '⏳ 执行中...' : '▶ 运行'}
-          </button>
-          <div className="query-db-selector">
-            <span className="db-selector-icon">📦</span>
-            <select
-              value={tab.schemaName}
-              onChange={e => {
-                updateTab(tab.id, { schemaName: e.target.value })
-                // Also update tab title
-                updateTab(tab.id, { schemaName: e.target.value, title: `无标题 @${e.target.value}` })
-              }}
-            >
-              <option value="">-- 选择数据库 --</option>
-              {schemas.map(s => (
-                <option key={s.name} value={s.name}>{s.name}</option>
-              ))}
-            </select>
-          </div>
-        </div>
-        <div
-          className="query-split-container"
-          ref={el => {
-            if (!el) return
-            // Set up resizable split
-            if (el.dataset.splitInit) return
-            el.dataset.splitInit = 'true'
-            const editorArea = el.querySelector('.query-editor-area') as HTMLElement
-            const handle = el.querySelector('.query-split-handle') as HTMLElement
-            if (!editorArea || !handle) return
-
-            let startY = 0
-            let startH = 0
-
-            function onMouseMove(e: MouseEvent) {
-              const delta = e.clientY - startY
-              const newH = Math.max(60, Math.min(startH + delta, el!.clientHeight - 80))
-              editorArea.style.height = `${newH}px`
-              editorArea.style.flex = 'none'
-            }
-            function onMouseUp() {
-              document.removeEventListener('mousemove', onMouseMove)
-              document.removeEventListener('mouseup', onMouseUp)
-              document.body.style.userSelect = ''
-              document.body.style.cursor = ''
-            }
-            handle.addEventListener('mousedown', (e: MouseEvent) => {
-              e.preventDefault()
-              startY = e.clientY
-              startH = editorArea.offsetHeight
-              document.body.style.userSelect = 'none'
-              document.body.style.cursor = 'row-resize'
-              document.addEventListener('mousemove', onMouseMove)
-              document.addEventListener('mouseup', onMouseUp)
-            })
-          }}
-        >
-          <div className="query-editor-area">
-            <SqlEditor
-              value={tab.sql}
-              onChange={v => updateTab(tab.id, { sql: v })}
-              onRun={() => void runQuery(tab.id)}
-              schemas={schemas}
-              currentSchema={tab.schemaName}
-            />
-          </div>
-          <div className="query-split-handle" title="拖拽调整大小" />
-          <div className="query-results">
-            {/* Result view tabs (Navicat-style) */}
-            {tab.results.length > 0 && (
-              <div className="result-view-tabs">
-                {tab.results.some(r => r.kind === 'rows') && tab.results.map((r, i) => r.kind === 'rows' ? (
-                  <button
-                    key={i}
-                    className={`result-view-tab${tab.activeResultIndex === i ? ' active' : ''}`}
-                    onClick={() => updateTab(tab.id, { activeResultIndex: i })}
-                  >
-                    {r.title || `结果 ${i + 1}`}
-                  </button>
-                ) : null)}
-                <button
-                  className={`result-view-tab${tab.activeResultIndex === -1 ? ' active' : ''}`}
-                  onClick={() => updateTab(tab.id, { activeResultIndex: -1 })}
-                >
-                  消息
-                </button>
-                <button
-                  className={`result-view-tab${tab.activeResultIndex === -2 ? ' active' : ''}`}
-                  onClick={() => updateTab(tab.id, { activeResultIndex: -2 })}
-                >
-                  摘要
-                </button>
-                <div style={{ flex: 1 }} />
-                {tab.durationMs > 0 && (
-                  <span style={{ fontSize: 11, color: '#888', padding: '0 8px', alignSelf: 'center' }}>运行时间: {(tab.durationMs / 1000).toFixed(3)}s</span>
-                )}
-              </div>
-            )}
-            <div className="result-grid-wrap">
-              {tab.results.length === 0 ? (
-                <div className="empty-state" style={{ padding: 40 }}>
-                  <span style={{ fontSize: 13, color: '#aaa' }}>运行查询以查看结果</span>
-                </div>
-              ) : tab.activeResultIndex === -1 ? (
-                /* 消息 tab */
-                <div className="query-messages">
-                  {tab.results.map((r, i) => (
-                    <div key={i} className="query-message-item">
-                      {r.kind === 'rows' ? (
-                        <>
-                          <div className="qm-sql">{r.title}</div>
-                          <div className="qm-info">&gt; {r.rows.length} 条记录</div>
-                          <div className="qm-time">&gt; Time: {(tab.durationMs / 1000 / tab.results.length).toFixed(3)}s</div>
-                        </>
-                      ) : r.kind === 'mutation' ? (
-                        <>
-                          <div className="qm-sql">{r.title}</div>
-                          <div className="qm-info">&gt; Affected rows: {r.affectedRows}</div>
-                          <div className="qm-time">&gt; Time: {(tab.durationMs / 1000 / tab.results.length).toFixed(3)}s</div>
-                        </>
-                      ) : (
-                        <>
-                          <div className="qm-sql">{r.title}</div>
-                          <div className="qm-info">&gt; {r.message}</div>
-                        </>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : tab.activeResultIndex === -2 ? (
-                /* 摘要 tab */
-                <table className="data-grid">
-                  <thead>
-                    <tr>
-                      <th>Query</th>
-                      <th>Message</th>
-                      <th>Time</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tab.results.map((r, i) => (
-                      <tr key={i}>
-                        <td style={{ maxWidth: 400 }}>{r.title}</td>
-                        <td>
-                          {r.kind === 'rows' ? `${r.rows.length} 条记录` : r.kind === 'mutation' ? `Affected rows: ${r.affectedRows}` : r.message}
-                        </td>
-                        <td>{(tab.durationMs / 1000 / tab.results.length).toFixed(6)}s</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : activeResult?.kind === 'rows' ? (
-                <table className="data-grid">
-                  <thead>
-                    <tr>
-                      <th className="row-num-header">#</th>
-                      {activeResult.columns.map(col => (
-                        <th key={col}>
-                          {col}
-                          <span className="col-resize-handle" onMouseDown={colResizeStart} />
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {activeResult.rows.map((row, i) => (
-                      <tr key={i}>
-                        <td className="row-num">{i + 1}</td>
-                        {activeResult.columns.map(col => {
-                          const { text, isNull } = formatCell(row[col])
-                          return <td key={col} className={isNull ? 'cell-null' : ''}>{text}</td>
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : activeResult?.kind === 'mutation' ? (
-                <div className="query-messages">
-                  <div className="query-message-item">
-                    <div className="qm-sql">{activeResult.title}</div>
-                    <div className="qm-info">&gt; Affected rows: {activeResult.affectedRows}</div>
-                    <div className="qm-time">&gt; Time: {(tab.durationMs / 1000).toFixed(3)}s</div>
-                  </div>
-                </div>
-              ) : (
-                <div className="empty-state" style={{ padding: 40 }}>
-                  <span style={{ fontSize: 13, color: '#aaa' }}>无结果</span>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
+      <QueryTabPane
+        key={tab.id}
+        tab={tab}
+        schemas={schemas}
+        history={history}
+        querySnippets={querySnippets}
+        flash={flash}
+        onPersistSql={persistQuerySql}
+        onChangeSchema={changeQuerySchema}
+        onRunQuery={runQuery}
+        onCancelRunningQuery={cancelRunningQuery}
+        onSaveSnippet={saveSnippet}
+        onClearHistory={clearQueryHistory}
+        onSetActiveResult={setQueryActiveResult}
+      />
     )
   }
 
@@ -2692,6 +3485,26 @@ export default function App() {
     )
   }
 
+  function renderDesignTab(tab: DesignTab) {
+    const conn = liveConnections.get(tab.connectionId)
+    if (!conn) return <div className="empty-state"><span className="empty-title">未连接</span></div>
+
+    return (
+      <DesignTabWrapper
+        key={tab.id}
+        tab={tab}
+        profile={conn.profile}
+        onSuccess={(message) => {
+          flash('success', message)
+          closeTab(tab.id)
+          void handleConnect(conn.profile)
+        }}
+        onError={(message) => flash('error', message)}
+        onCancel={() => closeTab(tab.id)}
+      />
+    )
+  }
+
   /* ── Tab content router ─────────────────────── */
   function renderTabContent() {
     if (!activeTab) {
@@ -2707,6 +3520,7 @@ export default function App() {
     if (activeTab.kind === 'data') return renderDataTab(activeTab as DataTab)
     if (activeTab.kind === 'query') return renderQueryTab(activeTab as QueryTab)
     if (activeTab.kind === 'cli') return renderCliTab(activeTab as CliTab)
+    if (activeTab.kind === 'design') return renderDesignTab(activeTab as DesignTab)
     return null
   }
 
@@ -2765,7 +3579,7 @@ export default function App() {
     }
 
     if (infoPanelContent.kind === 'table') {
-      const { profile, schemaName, tableName, ddl, columns } = infoPanelContent
+      const { profile, schemaName, tableName, ddl, columns, metadata } = infoPanelContent
       const statsKey = `${profile.id}:${schemaName}.${tableName}`
       const stats = tableStatsCache[statsKey]
 
@@ -2800,6 +3614,189 @@ export default function App() {
         ])
       }
 
+      function refreshTableIntrospection() {
+        setTableMetaCache(prev => {
+          const next = { ...prev }
+          delete next[statsKey]
+          return next
+        })
+        setTableStatsCache(prev => {
+          const next = { ...prev }
+          delete next[statsKey]
+          return next
+        })
+        setDdlCache(prev => {
+          const next = { ...prev }
+          delete next[statsKey]
+          return next
+        })
+        void fetchTableMetadata(profile, schemaName, tableName)
+        void fetchTableStats(profile, schemaName, tableName)
+        void fetchDdl(profile, schemaName, tableName)
+      }
+
+      async function createIndex() {
+        if (!columns || columns.length === 0) {
+          flash('error', '列信息尚未加载完成')
+          return
+        }
+
+        const defaultName = `idx_${tableName}_${columns[0].name}`
+        const name = prompt('索引名称', defaultName)?.trim()
+        if (!name) return
+
+        const columnInput = prompt(
+          `索引列（可用列: ${columns.map(column => column.name).join(', ')}）`,
+          columns[0].name,
+        )?.trim()
+        if (!columnInput) return
+
+        const selectedColumns = columnInput
+          .split(',')
+          .map(column => column.trim())
+          .filter(Boolean)
+
+        const unknownColumns = selectedColumns.filter(column =>
+          !columns.some(existingColumn => existingColumn.name === column),
+        )
+        if (selectedColumns.length === 0 || unknownColumns.length > 0) {
+          flash('error', unknownColumns.length > 0
+            ? `不存在的列: ${unknownColumns.join(', ')}`
+            : '至少需要一个索引列')
+          return
+        }
+
+        const unique = confirm('是否创建为唯一索引？')
+        const sql = `ALTER TABLE ${q(schemaName)}.${q(tableName)} ADD ${unique ? 'UNIQUE ' : ''}INDEX ${q(name)} (${selectedColumns.map(q).join(', ')})`
+
+        try {
+          await api.runQuery(profile, sql, schemaName)
+          flash('success', `已创建索引 ${name}`)
+          refreshTableIntrospection()
+        } catch (err) {
+          flash('error', `创建索引失败: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
+      async function dropIndex(indexName: string) {
+        if (!confirm(`确定要删除索引 ${indexName} 吗？`)) return
+
+        try {
+          await api.runQuery(profile, `ALTER TABLE ${q(schemaName)}.${q(tableName)} DROP INDEX ${q(indexName)}`, schemaName)
+          flash('success', `已删除索引 ${indexName}`)
+          refreshTableIntrospection()
+        } catch (err) {
+          flash('error', `删除索引失败: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
+      async function createForeignKey() {
+        if (!columns || columns.length === 0) {
+          flash('error', '列信息尚未加载完成')
+          return
+        }
+
+        const defaultName = `fk_${tableName}_${columns[0].name}`
+        const name = prompt('外键名称', defaultName)?.trim()
+        if (!name) return
+
+        const localColumnInput = prompt(
+          `本表列（可用列: ${columns.map(column => column.name).join(', ')}）`,
+          columns[0].name,
+        )?.trim()
+        if (!localColumnInput) return
+
+        const localColumns = localColumnInput
+          .split(',')
+          .map(column => column.trim())
+          .filter(Boolean)
+        const invalidLocalColumns = localColumns.filter(column =>
+          !columns.some(existingColumn => existingColumn.name === column),
+        )
+        if (localColumns.length === 0 || invalidLocalColumns.length > 0) {
+          flash('error', invalidLocalColumns.length > 0
+            ? `不存在的本表列: ${invalidLocalColumns.join(', ')}`
+            : '至少需要一个本表列')
+          return
+        }
+
+        const referencedTableInput = prompt('引用表（格式: schema.table）')?.trim()
+        if (!referencedTableInput || !referencedTableInput.includes('.')) {
+          flash('error', '引用表格式必须为 schema.table')
+          return
+        }
+        const [referencedSchema, referencedTable] = referencedTableInput.split('.', 2).map(part => part.trim())
+        if (!referencedSchema || !referencedTable) {
+          flash('error', '引用表格式必须为 schema.table')
+          return
+        }
+
+        let referencedColumns: string[] = []
+        try {
+          const referencedColumnList = await api.fetchTableColumns(profile, referencedSchema, referencedTable)
+          const referencedColumnInput = prompt(
+            `引用列（可用列: ${referencedColumnList.columns.map(column => column.name).join(', ')}）`,
+            referencedColumnList.columns[0]?.name ?? '',
+          )?.trim()
+          if (!referencedColumnInput) return
+
+          referencedColumns = referencedColumnInput
+            .split(',')
+            .map(column => column.trim())
+            .filter(Boolean)
+
+          const invalidReferencedColumns = referencedColumns.filter(column =>
+            !referencedColumnList.columns.some(existingColumn => existingColumn.name === column),
+          )
+          if (referencedColumns.length === 0 || invalidReferencedColumns.length > 0) {
+            flash('error', invalidReferencedColumns.length > 0
+              ? `不存在的引用列: ${invalidReferencedColumns.join(', ')}`
+              : '至少需要一个引用列')
+            return
+          }
+        } catch (err) {
+          flash('error', `无法读取引用表结构: ${err instanceof Error ? err.message : String(err)}`)
+          return
+        }
+
+        if (localColumns.length !== referencedColumns.length) {
+          flash('error', '本表列与引用列数量必须一致')
+          return
+        }
+
+        const normalizeRule = (value: string | null, fallback: string) =>
+          (value?.trim().toUpperCase() || fallback).replace(/\s+/g, ' ')
+
+        const onUpdate = normalizeRule(prompt('ON UPDATE 规则', 'RESTRICT'), 'RESTRICT')
+        const onDelete = normalizeRule(prompt('ON DELETE 规则', 'RESTRICT'), 'RESTRICT')
+        const allowedRules = new Set(['RESTRICT', 'CASCADE', 'SET NULL', 'NO ACTION'])
+        if (!allowedRules.has(onUpdate) || !allowedRules.has(onDelete)) {
+          flash('error', '规则仅支持 RESTRICT / CASCADE / SET NULL / NO ACTION')
+          return
+        }
+
+        const sql = `ALTER TABLE ${q(schemaName)}.${q(tableName)} ADD CONSTRAINT ${q(name)} FOREIGN KEY (${localColumns.map(q).join(', ')}) REFERENCES ${q(referencedSchema)}.${q(referencedTable)} (${referencedColumns.map(q).join(', ')}) ON UPDATE ${onUpdate} ON DELETE ${onDelete}`
+        try {
+          await api.runQuery(profile, sql, schemaName)
+          flash('success', `已创建外键 ${name}`)
+          refreshTableIntrospection()
+        } catch (err) {
+          flash('error', `创建外键失败: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
+      async function dropForeignKey(constraintName: string) {
+        if (!confirm(`确定要删除外键 ${constraintName} 吗？`)) return
+
+        try {
+          await api.runQuery(profile, `ALTER TABLE ${q(schemaName)}.${q(tableName)} DROP FOREIGN KEY ${q(constraintName)}`, schemaName)
+          flash('success', `已删除外键 ${constraintName}`)
+          refreshTableIntrospection()
+        } catch (err) {
+          flash('error', `删除外键失败: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
       return (
         <>
           <div className="info-header">
@@ -2825,6 +3822,16 @@ export default function App() {
               onClick={() => setInfoPanelTab('columns')}
               title="列"
             >📊</button>
+            <button
+              className={`info-tab${infoPanelTab === 'indexes' ? ' active' : ''}`}
+              onClick={() => setInfoPanelTab('indexes')}
+              title="索引"
+            >🔑</button>
+            <button
+              className={`info-tab${infoPanelTab === 'foreignKeys' ? ' active' : ''}`}
+              onClick={() => setInfoPanelTab('foreignKeys')}
+              title="外键"
+            >🔗</button>
           </div>
           {infoPanelTab === 'info' ? (
             <div className="info-body">
@@ -2858,7 +3865,7 @@ export default function App() {
                 <div style={{ color: '#aaa', fontSize: 12, padding: 8 }}>加载中...</div>
               )}
             </div>
-          ) : (
+          ) : infoPanelTab === 'columns' ? (
             <div className="info-body columns-body">
               {columns ? (
                 <table className="info-columns-table">
@@ -2881,6 +3888,94 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
+              ) : (
+                <div style={{ color: '#aaa', fontSize: 12, padding: 8 }}>加载中...</div>
+              )}
+            </div>
+          ) : infoPanelTab === 'indexes' ? (
+            <div className="info-body columns-body">
+              {metadata ? (
+                metadata.indexes.length > 0 ? (
+                  <>
+                    <div className="info-inline-actions">
+                      <button className="btn btn-sm btn-primary" onClick={() => void createIndex()}>新增索引</button>
+                    </div>
+                    <table className="info-columns-table">
+                      <thead>
+                        <tr>
+                          <th>名称</th>
+                          <th>列</th>
+                          <th>类型</th>
+                          <th>属性</th>
+                          <th>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {metadata.indexes.map(index => (
+                          <tr key={index.name}>
+                            <td className="col-name">{index.name}</td>
+                            <td className="col-type">{index.columns.join(', ')}</td>
+                            <td>{index.type || '--'}</td>
+                            <td>{index.primary ? 'PRIMARY' : index.unique ? 'UNIQUE' : 'INDEX'}</td>
+                            <td>
+                              {!index.primary && (
+                                <button className="btn btn-sm btn-danger" onClick={() => void dropIndex(index.name)}>删除</button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                ) : (
+                  <div style={{ padding: 8 }}>
+                    <div style={{ color: '#aaa', fontSize: 12, marginBottom: 8 }}>暂无索引信息</div>
+                    <button className="btn btn-sm btn-primary" onClick={() => void createIndex()}>新增索引</button>
+                  </div>
+                )
+              ) : (
+                <div style={{ color: '#aaa', fontSize: 12, padding: 8 }}>加载中...</div>
+              )}
+            </div>
+          ) : (
+            <div className="info-body columns-body">
+              {metadata ? (
+                metadata.foreignKeys.length > 0 ? (
+                  <>
+                    <div className="info-inline-actions">
+                      <button className="btn btn-sm btn-primary" onClick={() => void createForeignKey()}>新增外键</button>
+                    </div>
+                    <table className="info-columns-table">
+                      <thead>
+                        <tr>
+                          <th>名称</th>
+                          <th>列</th>
+                          <th>引用</th>
+                          <th>规则</th>
+                          <th>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {metadata.foreignKeys.map(foreignKey => (
+                          <tr key={foreignKey.name}>
+                            <td className="col-name">{foreignKey.name}</td>
+                            <td className="col-type">{foreignKey.columns.join(', ')}</td>
+                            <td>{`${foreignKey.referencedSchema}.${foreignKey.referencedTable} (${foreignKey.referencedColumns.join(', ')})`}</td>
+                            <td>{`ON UPDATE ${foreignKey.onUpdate} / ON DELETE ${foreignKey.onDelete}`}</td>
+                            <td>
+                              <button className="btn btn-sm btn-danger" onClick={() => void dropForeignKey(foreignKey.name)}>删除</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                ) : (
+                  <div style={{ padding: 8 }}>
+                    <div style={{ color: '#aaa', fontSize: 12, marginBottom: 8 }}>暂无外键信息</div>
+                    <button className="btn btn-sm btn-primary" onClick={() => void createForeignKey()}>新增外键</button>
+                  </div>
+                )
               ) : (
                 <div style={{ color: '#aaa', fontSize: 12, padding: 8 }}>加载中...</div>
               )}
@@ -3143,11 +4238,15 @@ export default function App() {
             if (!sidebar) return
             const startX = e.clientX
             const startW = sidebar.offsetWidth
+            const widthUpdater = createRafUpdater<number>((width) => {
+              sidebar.style.width = `${width}px`
+            })
             function onMove(ev: MouseEvent) {
               const w = Math.max(140, Math.min(startW + ev.clientX - startX, 500))
-              sidebar.style.width = `${w}px`
+              widthUpdater.schedule(w)
             }
             function onUp() {
+              widthUpdater.flush()
               document.removeEventListener('mousemove', onMove)
               document.removeEventListener('mouseup', onUp)
               document.body.style.userSelect = ''
@@ -3216,11 +4315,15 @@ export default function App() {
             if (!infoPanel) return
             const startX = e.clientX
             const startW = infoPanel.offsetWidth
+            const widthUpdater = createRafUpdater<number>((width) => {
+              infoPanel.style.width = `${width}px`
+            })
             function onMove(ev: MouseEvent) {
               const w = Math.max(180, Math.min(startW - (ev.clientX - startX), 600))
-              infoPanel.style.width = `${w}px`
+              widthUpdater.schedule(w)
             }
             function onUp() {
+              widthUpdater.flush()
               document.removeEventListener('mousemove', onMove)
               document.removeEventListener('mouseup', onUp)
               document.body.style.userSelect = ''
@@ -3256,7 +4359,7 @@ export default function App() {
       {ctxMenu && (
         <>
           <div className="context-menu-overlay" onClick={closeContextMenu} onContextMenu={e => { e.preventDefault(); closeContextMenu() }} />
-          <div className="context-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+          <div ref={ctxMenuRef} className="context-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
             {ctxMenu.items.map((item, i) =>
               item === 'separator' ? (
                 <div key={`sep-${i}`} className="ctx-sep" />

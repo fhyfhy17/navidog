@@ -4,6 +4,7 @@ import type {
   QueryExecutionResponse,
   SchemaTreeResponse,
   TableColumnsResponse,
+  TableMetadataResponse,
   TestConnectionResponse,
 } from './types'
 
@@ -43,8 +44,31 @@ export const api = {
       tableName,
     })
   },
-  runQuery(connection: ConnectionProfile, sql: string, database?: string) {
-    return request<QueryExecutionResponse>('/query', { connection, sql, database })
+  fetchTableMetadata(connection: ConnectionProfile, schemaName: string, tableName: string) {
+    return request<TableMetadataResponse>('/schema/table-meta', {
+      connection,
+      schemaName,
+      tableName,
+    })
+  },
+  runQuery(connection: ConnectionProfile, sql: string, database?: string, queryId?: string) {
+    return request<QueryExecutionResponse>('/query', { connection, sql, database, queryId })
+  },
+  runStatements(
+    connection: ConnectionProfile,
+    statements: string[],
+    database?: string,
+    transaction = true,
+  ) {
+    return request<QueryExecutionResponse>('/query/batch', {
+      connection,
+      statements,
+      database,
+      transaction,
+    })
+  },
+  cancelQuery(queryId: string) {
+    return request<{ ok: boolean }>('/query/cancel', { queryId })
   },
   importBatch(
     connection: ConnectionProfile,

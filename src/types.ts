@@ -10,6 +10,8 @@ export type ConnectionProfile = {
   database?: string
   ssl?: boolean
   sslRejectUnauthorized?: boolean
+  color?: string
+  group?: string
   // SSH tunnel
   useSSH: boolean
   sshHost?: string
@@ -39,6 +41,29 @@ export type TableColumn = {
   type: string
   nullable: boolean
   key: string
+  extra?: string
+  defaultValue?: string
+  comment?: string
+}
+
+export type TableIndex = {
+  name: string
+  unique: boolean
+  primary: boolean
+  type: string
+  columns: string[]
+  cardinality?: number | null
+  comment?: string
+}
+
+export type TableForeignKey = {
+  name: string
+  columns: string[]
+  referencedSchema: string
+  referencedTable: string
+  referencedColumns: string[]
+  onUpdate: string
+  onDelete: string
 }
 
 export type ImportCreateTablePlan = {
@@ -91,6 +116,11 @@ export type TableColumnsResponse = {
   columns: TableColumn[]
 }
 
+export type TableMetadataResponse = {
+  indexes: TableIndex[]
+  foreignKeys: TableForeignKey[]
+}
+
 export type QueryExecutionResponse = {
   durationMs: number
   results: QueryResultSet[]
@@ -117,7 +147,11 @@ export type DataTab = {
   columns: string[]
   rows: Record<string, unknown>[]
   page: number
+  pageCursors: (Record<string, unknown> | null)[]
+  pagingMode: 'offset' | 'primaryKey'
   totalRows: number
+  hasMore: boolean
+  rowCountExact: boolean
   loading: boolean
 }
 
@@ -131,6 +165,7 @@ export type QueryTab = {
   results: QueryResultSet[]
   activeResultIndex: number
   durationMs: number
+  activeQueryId?: string
   loading: boolean
 }
 
@@ -144,7 +179,17 @@ export type CliTab = {
   loading: boolean
 }
 
-export type AppTab = ObjectsTab | DataTab | QueryTab | CliTab
+export type DesignTab = {
+  id: string
+  kind: 'design'
+  title: string
+  connectionId: string
+  schemaName: string
+  tableName: string
+  mode: 'create' | 'alter'
+}
+
+export type AppTab = ObjectsTab | DataTab | QueryTab | CliTab | DesignTab
 
 /* ── Tree selection ─────────────────────────── */
 
