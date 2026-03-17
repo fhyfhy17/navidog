@@ -353,6 +353,10 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   min-height: 24px;
 }
 .tree-node:hover { background: var(--select-bg-hover); }
+.tree-node.connecting {
+  background: linear-gradient(90deg, rgba(41, 104, 200, 0.12), transparent 70%);
+  border-color: rgba(41, 104, 200, 0.12);
+}
 .tree-node.selected {
   background: var(--select-bg);
   color: var(--select-text);
@@ -392,8 +396,54 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 }
 
 .tree-label {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tree-connection-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid #d4dae3;
+  background: radial-gradient(circle at 35% 35%, #ffffff 0%, #f5f7fb 38%, #d9dee7 100%);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.9);
+}
+
+.tree-connection-dot.online {
+  border-color: rgba(52, 199, 89, 0.38);
+  background: radial-gradient(circle at 35% 35%, #b7f7b0 0%, #63d85f 40%, #27a844 100%);
+  box-shadow: 0 0 10px rgba(52, 199, 89, 0.28);
+}
+
+.tree-connection-dot.connecting {
+  border-width: 2px;
+  border-style: solid;
+  border-color: rgba(41, 104, 200, 0.18);
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  background: rgba(255,255,255,0.95);
+  box-shadow: 0 0 0 2px rgba(41, 104, 200, 0.08);
+  animation: spin-ring 780ms linear infinite;
+}
+
+.tree-activity-badge {
+  flex-shrink: 0;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(41, 104, 200, 0.2);
+  background: rgba(41, 104, 200, 0.12);
+  color: #1f5ec7;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.tree-node.selected .tree-activity-badge {
+  color: rgba(255,255,255,0.96);
+  background: rgba(255,255,255,0.16);
+  border-color: rgba(255,255,255,0.28);
 }
 
 .tree-children {
@@ -1809,6 +1859,30 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 }
 .status-dot.online { background: var(--success); }
 .status-dot.offline { background: var(--text-muted); }
+.status-dot.connecting {
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  background: transparent;
+  border: 2px solid rgba(41, 104, 200, 0.2);
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  animation: spin-ring 780ms linear infinite;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(41, 104, 200, 0.14);
+  background: rgba(41, 104, 200, 0.08);
+  color: #1f5ec7;
+}
+
+@keyframes spin-ring {
+  to { transform: rotate(360deg); }
+}
 
 /* ═══════════════════════════════════════════════
    Connection Modal
@@ -2047,8 +2121,6 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   position: fixed;
   z-index: 801;
   min-width: 200px;
-  max-height: calc(100vh - 16px);
-  overflow-y: auto;
   background: rgba(255,255,255,0.96);
   backdrop-filter: blur(20px) saturate(180%);
   border: 1px solid rgba(0,0,0,0.12);

@@ -3,6 +3,10 @@ import type {
   ImportCreateTablePlan,
   QueryExecutionResponse,
   SchemaTreeResponse,
+  SshExecResponse,
+  SshShellSessionReadResponse,
+  SshShellSessionStartResponse,
+  SshTarget,
   TableColumnsResponse,
   TableMetadataResponse,
   TestConnectionResponse,
@@ -69,6 +73,62 @@ export const api = {
   },
   cancelQuery(queryId: string) {
     return request<{ ok: boolean }>('/query/cancel', { queryId })
+  },
+  runSshCommand(
+    connection: ConnectionProfile,
+    command: string,
+    sshTarget?: SshTarget,
+    timeoutMs?: number,
+  ) {
+    return request<SshExecResponse>('/ssh/exec', {
+      connection,
+      command,
+      sshTarget,
+      timeoutMs,
+    })
+  },
+  startSshShell(
+    connection: ConnectionProfile,
+    sshTarget?: SshTarget,
+    options?: {
+      cols?: number
+      rows?: number
+      term?: string
+      idleTimeoutMs?: number
+    },
+  ) {
+    return request<SshShellSessionStartResponse>('/ssh/session/start', {
+      connection,
+      sshTarget,
+      cols: options?.cols,
+      rows: options?.rows,
+      term: options?.term,
+      idleTimeoutMs: options?.idleTimeoutMs,
+    })
+  },
+  readSshShell(sessionId: string, afterSeq?: number, limit?: number) {
+    return request<SshShellSessionReadResponse>('/ssh/session/read', {
+      sessionId,
+      afterSeq,
+      limit,
+    })
+  },
+  writeSshShellInput(sessionId: string, input: string, appendNewline = true) {
+    return request<{ ok: true; sessionId: string; nextSeq: number }>('/ssh/session/input', {
+      sessionId,
+      input,
+      appendNewline,
+    })
+  },
+  resizeSshShell(sessionId: string, cols: number, rows: number) {
+    return request<{ ok: true; sessionId: string }>('/ssh/session/resize', {
+      sessionId,
+      cols,
+      rows,
+    })
+  },
+  closeSshShell(sessionId: string) {
+    return request<{ ok: true }>('/ssh/session/close', { sessionId })
   },
   importBatch(
     connection: ConnectionProfile,

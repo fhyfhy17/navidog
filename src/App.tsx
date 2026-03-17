@@ -1039,6 +1039,7 @@ export default function App() {
 
   /* ── Connection state ───────────────────────── */
   const [liveConnections, setLiveConnections] = useState<Map<string, { profile: ConnectionProfile; schemas: SchemaNode[]; version: string }>>(new Map())
+  const [connectingProfiles, setConnectingProfiles] = useState<Set<string>>(new Set())
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
   const [selectedNode, setSelectedNode] = useState<SelectedNode | null>(null)
   const [treeFilter, setTreeFilter] = useState('')
@@ -1114,6 +1115,7 @@ export default function App() {
 
   const tabsRef = useRef(tabs)
   const liveConnectionsRef = useRef(liveConnections)
+  const connectingProfilesRef = useRef(connectingProfiles)
 
   useEffect(() => {
     tabsRef.current = tabs
@@ -1122,6 +1124,10 @@ export default function App() {
   useEffect(() => {
     liveConnectionsRef.current = liveConnections
   }, [liveConnections])
+
+  useEffect(() => {
+    connectingProfilesRef.current = connectingProfiles
+  }, [connectingProfiles])
 
   const flash = useCallback((tone: 'success' | 'error', message: string) => {
     setNotice({ tone, message })
@@ -1330,8 +1336,9 @@ export default function App() {
 
   function connContextMenu(e: React.MouseEvent, profile: ConnectionProfile) {
     const isLive = liveConnections.has(profile.id)
+    const isConnecting = connectingProfiles.has(profile.id)
     showContextMenu(e, [
-      { icon: '🔗', label: '打开连接', action: () => { closeContextMenu(); if (isLive) { setExpandedNodes(prev => { const s = new Set(prev); s.add(`conn:${profile.id}`); return s }) } else { void handleConnect(profile) } } },
+      { icon: '🔗', label: isConnecting ? '正在连接...' : '打开连接', action: () => { closeContextMenu(); if (isLive) { setExpandedNodes(prev => { const s = new Set(prev); s.add(`conn:${profile.id}`); return s }) } else { void handleConnect(profile) } }, disabled: isConnecting },
       { icon: '⛔', label: '断开连接', action: () => { closeContextMenu(); void handleDisconnect(profile.id) }, disabled: !isLive },
       'separator',
       { icon: '✏️', label: '编辑连接...', action: () => { closeContextMenu(); openEditConnectionModal(profile) } },
@@ -1355,7 +1362,7 @@ export default function App() {
         }
       }, disabled: !isLive },
       'separator',
-      { icon: '🔄', label: '刷新', shortcut: '⌘R', action: () => { closeContextMenu(); if (isLive) void handleConnect(profile) } },
+      { icon: '🔄', label: isConnecting ? '连接中...' : '刷新', shortcut: '⌘R', action: () => { closeContextMenu(); if (isLive) void handleConnect(profile) }, disabled: isConnecting || !isLive },
     ])
   }
 
@@ -1782,6 +1789,14 @@ export default function App() {
      ═══════════════════════════════════════════════ */
 
   async function handleConnect(profile: ConnectionProfile) {
+    if (connectingProfilesRef.current.has(profile.id)) return
+
+    setConnectingProfiles(prev => {
+      const next = new Set(prev)
+      next.add(profile.id)
+      return next
+    })
+
     try {
       const health = await api.testConnection(profile)
       const tree = await api.fetchSchemaTree(profile)
@@ -1801,6 +1816,13 @@ export default function App() {
       flash('success', `已连接 ${profile.label} — MySQL ${health.version}`)
     } catch (err) {
       flash('error', err instanceof Error ? err.message : '连接失败')
+    } finally {
+      setConnectingProfiles(prev => {
+        if (!prev.has(profile.id)) return prev
+        const next = new Set(prev)
+        next.delete(profile.id)
+        return next
+      })
     }
   }
 
@@ -2253,6 +2275,7 @@ export default function App() {
         profile,
         version: conn?.version ?? '',
         online: !!conn,
+        connecting: connectingProfiles.has(selectedNode.connectionId),
       }
     }
 
@@ -2284,7 +2307,7 @@ export default function App() {
     }
 
     return null
-  }, [selectedNode, liveConnections, profiles, ddlCache, columnCache, tableMetaCache])
+  }, [selectedNode, liveConnections, profiles, ddlCache, columnCache, tableMetaCache, connectingProfiles])
 
   /* ═══════════════════════════════════════════════
      Renderers
@@ -2301,13 +2324,15 @@ export default function App() {
           const isExpanded = expandedNodes.has(connKey)
           const conn = liveConnections.get(profile.id)
           const isLive = !!conn
+          const isConnecting = connectingProfiles.has(profile.id)
           const isNodeSelected = selectedNode?.kind === 'connection' && selectedNode.connectionId === profile.id
 
           return (
             <div key={profile.id}>
               <div
-                className={`tree-node${isNodeSelected ? ' selected' : ''}`}
+                className={`tree-node${isNodeSelected ? ' selected' : ''}${isConnecting ? ' connecting' : ''}`}
                 style={{ paddingLeft: 4 }}
+                aria-busy={isConnecting}
                 onClick={() => {
                   setSelectedNode({ kind: 'connection', connectionId: profile.id })
                   toggleNode(connKey)
@@ -2322,8 +2347,11 @@ export default function App() {
                 onContextMenu={e => connContextMenu(e, profile)}
               >
                 <span className={`tree-arrow${isExpanded ? ' expanded' : ''}`}>▶</span>
-                <span className="tree-icon">{isLive ? '🟢' : '⚪'}</span>
+                <span className="tree-icon">
+                  <span className={`tree-connection-dot ${isConnecting ? 'connecting' : isLive ? 'online' : 'offline'}`} />
+                </span>
                 <span className="tree-label">{profile.label}</span>
+                {isConnecting && <span className="tree-activity-badge">连接中...</span>}
               </div>
 
               {isExpanded && conn && conn.schemas
@@ -3580,7 +3608,7 @@ export default function App() {
     }
 
     if (infoPanelContent.kind === 'connection') {
-      const { profile, version, online } = infoPanelContent
+      const { profile, version, online, connecting } = infoPanelContent
       return (
         <>
           <div className="info-header">
@@ -3592,7 +3620,7 @@ export default function App() {
           </div>
           <div className="info-body">
             {version && <div className="info-row"><span className="info-label">服务器版本</span><span className="info-value">{version}</span></div>}
-            <div className="info-row"><span className="info-label">状态</span><span className="info-value">{online ? '🟢 已连接' : '⚪ 未连接'}</span></div>
+            <div className="info-row"><span className="info-label">状态</span><span className="info-value">{connecting ? '🟦 正在连接...' : online ? '🟢 已连接' : '⚪ 未连接'}</span></div>
             <div className="info-row"><span className="info-label">主机</span><span className="info-value">{profile.host}</span></div>
             <div className="info-row"><span className="info-label">端口</span><span className="info-value">{profile.port}</span></div>
             <div className="info-row"><span className="info-label">用户名</span><span className="info-value">{profile.user}</span></div>
@@ -4183,6 +4211,9 @@ export default function App() {
 
   // Determine the current "context" for new query button
   const currentConnectionId = selectedNode?.connectionId ?? (liveConnections.size > 0 ? Array.from(liveConnections.keys())[0] : null)
+  const connectingProfileLabels = profiles
+    .filter(profile => connectingProfiles.has(profile.id))
+    .map(profile => profile.label)
   const currentSchemaName = (() => {
     if (selectedNode?.kind === 'database' || selectedNode?.kind === 'table') return selectedNode.schemaName
     if (currentConnectionId) {
@@ -4273,7 +4304,7 @@ export default function App() {
             )}
           </div>
           <div style={{ borderTop: '1px solid #e6e6e6', padding: '4px 8px', fontSize: 11, color: '#999' }}>
-            {profiles.length} 个连接，{liveConnections.size} 个活跃
+            {profiles.length} 个连接，{liveConnections.size} 个活跃{connectingProfiles.size > 0 ? `，${connectingProfiles.size} 个连接中` : ''}
           </div>
         </div>
 
@@ -4339,7 +4370,13 @@ export default function App() {
                 }}
               >
                 <span className="tab-icon">
-                  {tab.kind === 'objects' ? '📋' : tab.kind === 'data' ? '📊' : tab.kind === 'cli' ? '💻' : '📝'}
+                  {tab.kind === 'objects'
+                    ? '📋'
+                    : tab.kind === 'data'
+                      ? '📊'
+                      : tab.kind === 'cli'
+                        ? '💻'
+                        : '📝'}
                 </span>
                 <span className="tab-title">{tab.title}</span>
                 <button className="tab-close" onClick={e => { e.stopPropagation(); closeTab(tab.id) }}>✕</button>
@@ -4394,9 +4431,16 @@ export default function App() {
       {/* ── Status bar ───────────────────────────── */}
       <div className="status-bar">
         <span>
-          <span className={`status-dot ${liveConnections.size > 0 ? 'online' : 'offline'}`} />
-          {liveConnections.size > 0 ? '已连接' : '未连接'}
+          <span className={`status-dot ${connectingProfiles.size > 0 ? 'connecting' : liveConnections.size > 0 ? 'online' : 'offline'}`} />
+          {connectingProfiles.size > 0 ? '正在连接' : liveConnections.size > 0 ? '已连接' : '未连接'}
         </span>
+        {connectingProfileLabels.length > 0 && (
+          <span className="status-pill">
+            {connectingProfileLabels.length === 1
+              ? `正在连接 ${connectingProfileLabels[0]}...`
+              : `${connectingProfileLabels.length} 个连接正在建立`}
+          </span>
+        )}
         <span>{profiles.length} 个连接</span>
         {activeTab?.kind === 'data' && (
           <span>{(activeTab as DataTab).rows.length} 条记录</span>

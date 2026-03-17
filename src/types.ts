@@ -126,6 +126,54 @@ export type QueryExecutionResponse = {
   results: QueryResultSet[]
 }
 
+export type SshTarget = {
+  host?: string
+  port?: number
+  user?: string
+}
+
+export type SshExecResponse = {
+  host: string
+  port: number
+  user: string
+  command: string
+  stdout: string
+  stderr: string
+  exitCode: number | null
+  signal?: string
+  durationMs: number
+  truncated: boolean
+}
+
+export type SshShellChunk = {
+  seq: number
+  stream: 'stdout' | 'stderr' | 'system'
+  text: string
+  timestamp: number
+}
+
+export type SshShellSessionStartResponse = {
+  sessionId: string
+  host: string
+  port: number
+  user: string
+  nextSeq: number
+  createdAt: number
+}
+
+export type SshShellSessionReadResponse = {
+  sessionId: string
+  host: string
+  port: number
+  user: string
+  chunks: SshShellChunk[]
+  nextSeq: number
+  closed: boolean
+  exitCode: number | null
+  signal?: string
+  lastActiveAt: number
+}
+
 /* ── Tab system ─────────────────────────────── */
 
 export type ObjectsTab = {

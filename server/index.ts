@@ -16,6 +16,15 @@ import {
   testConnection,
 } from './mysql.js'
 import { importBatch } from './import.js'
+import {
+  closeAllSshShellSessions,
+  closeSshShellSession,
+  executeSshCommand,
+  readSshShellSession,
+  resizeSshShellSession,
+  startSshShellSession,
+  writeSshShellInput,
+} from './ssh.js'
 
 const app = express()
 const host = '127.0.0.1'
@@ -160,6 +169,104 @@ app.post('/api/query/cancel', async (request, response) => {
   }
 })
 
+app.post('/api/ssh/exec', async (request, response) => {
+  try {
+    const connection = normalizeConnectionPayload(request.body.connection)
+    const startedAt = Date.now()
+    const result = await executeSshCommand(connection, {
+      command: request.body.command,
+      timeoutMs: request.body.timeoutMs,
+      sshTarget: request.body.sshTarget,
+    })
+    response.json({
+      ...result,
+      durationMs: Date.now() - startedAt,
+    })
+  } catch (error) {
+    console.error('[/api/ssh/exec] ERROR:', error)
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'SSH command failed.',
+    })
+  }
+})
+
+app.post('/api/ssh/session/start', async (request, response) => {
+  try {
+    const connection = normalizeConnectionPayload(request.body.connection)
+    const result = await startSshShellSession(connection, {
+      sshTarget: request.body.sshTarget,
+      cols: request.body.cols,
+      rows: request.body.rows,
+      term: request.body.term,
+      idleTimeoutMs: request.body.idleTimeoutMs,
+    })
+    response.json(result)
+  } catch (error) {
+    console.error('[/api/ssh/session/start] ERROR:', error)
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'SSH shell start failed.',
+    })
+  }
+})
+
+app.post('/api/ssh/session/read', (request, response) => {
+  try {
+    const result = readSshShellSession({
+      sessionId: request.body.sessionId,
+      afterSeq: request.body.afterSeq,
+      limit: request.body.limit,
+    })
+    response.json(result)
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'SSH shell read failed.',
+    })
+  }
+})
+
+app.post('/api/ssh/session/input', (request, response) => {
+  try {
+    const result = writeSshShellInput({
+      sessionId: request.body.sessionId,
+      input: request.body.input,
+      appendNewline: request.body.appendNewline,
+    })
+    response.json(result)
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'SSH shell input failed.',
+    })
+  }
+})
+
+app.post('/api/ssh/session/resize', (request, response) => {
+  try {
+    const result = resizeSshShellSession({
+      sessionId: request.body.sessionId,
+      cols: request.body.cols,
+      rows: request.body.rows,
+    })
+    response.json(result)
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'SSH shell resize failed.',
+    })
+  }
+})
+
+app.post('/api/ssh/session/close', (request, response) => {
+  try {
+    const result = closeSshShellSession({
+      sessionId: request.body.sessionId,
+    })
+    response.json(result)
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : 'SSH shell close failed.',
+    })
+  }
+})
+
 /* ── Data Import ────────────────────────────── */
 app.post('/api/import/batch', async (request, response) => {
   try {
@@ -215,6 +322,7 @@ const server = app.listen(port, host, () => {
 })
 
 async function shutdown() {
+  closeAllSshShellSessions()
   await closePools()
   server.close(() => {
     process.exit(0)
