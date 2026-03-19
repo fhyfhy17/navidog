@@ -1,5 +1,6 @@
 import express from 'express'
 import fs from 'node:fs'
+import type { Socket } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -29,8 +30,25 @@ import {
 const app = express()
 const host = '127.0.0.1'
 const port = Number.parseInt(process.env.PORT ?? '3001', 10)
+const shutdownGraceMs = Number.parseInt(process.env.NAVIDOG_SHUTDOWN_GRACE_MS ?? '5000', 10)
+const openSockets = new Set<Socket>()
+
+let isShuttingDown = false
+let shutdownPromise: Promise<void> | undefined
 
 app.use(express.json({ limit: '50mb' }))
+
+app.use((_request, response, next) => {
+  if (!isShuttingDown) {
+    next()
+    return
+  }
+
+  response.setHeader('Connection', 'close')
+  response.status(503).json({
+    error: 'NaviDog is shutting down. Please retry in a moment.',
+  })
+})
 
 app.get('/api/health', (_request, response) => {
   response.json({ ok: true })
@@ -321,18 +339,100 @@ const server = app.listen(port, host, () => {
   console.log(`NaviDog listening on http://${host}:${port}`)
 })
 
-async function shutdown() {
-  closeAllSshShellSessions()
-  await closePools()
-  server.close(() => {
-    process.exit(0)
+server.keepAliveTimeout = 1_000
+server.headersTimeout = 5_000
+server.requestTimeout = 30_000
+
+server.on('connection', (socket) => {
+  openSockets.add(socket)
+
+  socket.on('close', () => {
+    openSockets.delete(socket)
+  })
+
+  if (isShuttingDown) {
+    socket.destroy()
+    return
+  }
+})
+
+function destroyOpenSockets() {
+  for (const socket of openSockets) {
+    socket.destroy()
+  }
+  openSockets.clear()
+}
+
+function closeHttpServer() {
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error)
+        return
+      }
+      resolve()
+    })
+    server.closeIdleConnections?.()
   })
 }
 
-process.on('SIGINT', () => {
-  void shutdown()
+function getSignalExitCode(signal: NodeJS.Signals) {
+  return signal === 'SIGINT' ? 130 : 143
+}
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shutdownPromise) {
+    console.warn(`[NaviDog] Received ${signal} again, forcing shutdown.`)
+    server.closeAllConnections?.()
+    destroyOpenSockets()
+    process.exit(getSignalExitCode(signal))
+  }
+
+  isShuttingDown = true
+  console.log(`[NaviDog] Received ${signal}, shutting down...`)
+
+  const forceShutdownTimer = setTimeout(() => {
+    console.error(`[NaviDog] Shutdown exceeded ${shutdownGraceMs}ms. Forcing exit.`)
+    server.closeAllConnections?.()
+    destroyOpenSockets()
+    process.exit(1)
+  }, shutdownGraceMs)
+  forceShutdownTimer.unref()
+
+  shutdownPromise = (async () => {
+    const results = await Promise.allSettled([
+      (async () => {
+        closeAllSshShellSessions()
+        await closePools()
+      })(),
+      closeHttpServer(),
+    ])
+
+    clearTimeout(forceShutdownTimer)
+    server.closeAllConnections?.()
+    destroyOpenSockets()
+
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => result.reason)
+
+    if (failures.length > 0) {
+      for (const failure of failures) {
+        console.error('[NaviDog] Shutdown failed:', failure)
+      }
+      process.exit(1)
+    }
+
+    process.exit(0)
+  })()
+
+  return shutdownPromise
+}
+
+process.once('SIGINT', () => {
+  void shutdown('SIGINT')
 })
 
-process.on('SIGTERM', () => {
-  void shutdown()
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM')
 })

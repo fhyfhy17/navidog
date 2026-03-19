@@ -513,6 +513,262 @@ const VirtualQueryGrid = memo(function VirtualQueryGrid({
   )
 })
 
+type DataGridRow = {
+  data: Record<string, unknown>
+  type: 'existing' | 'new'
+  originalIdx: number
+}
+
+type VirtualDataGridProps = {
+  columns: string[]
+  rows: DataGridRow[]
+  rowOffset: number
+  resetScrollKey: unknown
+  selectedRows: Set<number>
+  deletedRows: Set<number>
+  editingCell: { row: number; col: string } | null
+  orderBy: { col: string; dir: 'ASC' | 'DESC' } | null
+  colSortMenu: string | null
+  onSetSortMenu: (column: string | null) => void
+  onApplySort: (column: string, dir: 'ASC' | 'DESC' | null) => void
+  onRowClick: (event: React.MouseEvent, rowIndex: number) => void
+  onCellContextMenu: (event: React.MouseEvent, cellText: string, colName: string, rowIndex: number) => void
+  onStartEdit: (rowIndex: number, colName: string) => void
+  onCommitCell: (row: DataGridRow, colName: string, value: string) => void
+  onCancelEdit: () => void
+  getCellValue: (row: DataGridRow, colName: string) => unknown
+  isCellModified: (row: DataGridRow, colName: string) => boolean
+}
+
+function VirtualDataGrid({
+  columns,
+  rows,
+  rowOffset,
+  resetScrollKey,
+  selectedRows,
+  deletedRows,
+  editingCell,
+  orderBy,
+  colSortMenu,
+  onSetSortMenu,
+  onApplySort,
+  onRowClick,
+  onCellContextMenu,
+  onStartEdit,
+  onCommitCell,
+  onCancelEdit,
+  getCellValue,
+  isCellModified,
+}: VirtualDataGridProps) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewHeight, setViewHeight] = useState(400)
+  const [manualColumnWidths, setManualColumnWidths] = useState<Record<string, number>>({})
+  const scrollUpdaterRef = useRef(createRafUpdater<number>((value) => {
+    setScrollTop((prev) => (prev === value ? prev : value))
+  }))
+
+  const columnWidths = useMemo(
+    () => Object.fromEntries(
+      columns.map((column) => [column, manualColumnWidths[column] ?? estimateQueryColumnWidth(column)]),
+    ),
+    [columns, manualColumnWidths],
+  )
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    setViewHeight((prev) => (prev === el.clientHeight ? prev : el.clientHeight))
+    const ro = new ResizeObserver(() => {
+      const nextHeight = el.clientHeight
+      setViewHeight((prev) => (prev === nextHeight ? prev : nextHeight))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => () => {
+    scrollUpdaterRef.current.cancel()
+  }, [])
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0
+  }, [resetScrollKey])
+
+  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
+  const visibleCount = Math.ceil(viewHeight / ROW_HEIGHT) + OVERSCAN * 2
+  const endIdx = Math.min(rows.length, startIdx + visibleCount)
+  const topPad = startIdx * ROW_HEIGHT
+  const bottomPad = Math.max(0, (rows.length - endIdx) * ROW_HEIGHT)
+  const visibleRows = useMemo(() => rows.slice(startIdx, endIdx), [rows, startIdx, endIdx])
+  const tableWidth = useMemo(
+    () => QUERY_ROW_NUM_WIDTH + columns.reduce((total, column) => total + (columnWidths[column] ?? estimateQueryColumnWidth(column)), 0),
+    [columnWidths, columns],
+  )
+
+  const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    scrollUpdaterRef.current.schedule((e.target as HTMLElement).scrollTop)
+  }, [])
+
+  const handleColumnResizeStart = useCallback((column: string, e: React.MouseEvent<HTMLSpanElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startW = columnWidths[column] ?? estimateQueryColumnWidth(column)
+    const widthUpdater = createRafUpdater<number>((width) => {
+      setManualColumnWidths((prev) => (prev[column] === width ? prev : { ...prev, [column]: width }))
+    })
+
+    function onMove(ev: MouseEvent) {
+      const width = Math.max(QUERY_MIN_COL_WIDTH, startW + ev.clientX - startX)
+      widthUpdater.schedule(width)
+    }
+
+    function onUp() {
+      widthUpdater.flush()
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.userSelect = ''
+      document.body.style.cursor = ''
+    }
+
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [columnWidths])
+
+  return (
+    <div
+      ref={scrollRef}
+      className="data-grid-wrap"
+      onClick={() => onSetSortMenu(null)}
+      onScroll={handleScroll}
+    >
+      <table className="data-grid" style={{ width: tableWidth, minWidth: tableWidth, tableLayout: 'fixed' }}>
+        <colgroup>
+          <col style={{ width: QUERY_ROW_NUM_WIDTH, minWidth: QUERY_ROW_NUM_WIDTH }} />
+          {columns.map((column) => {
+            const width = columnWidths[column] ?? estimateQueryColumnWidth(column)
+            return <col key={column} style={{ width, minWidth: width }} />
+          })}
+        </colgroup>
+        <thead>
+          <tr>
+            <th className="row-num-header">#</th>
+            {columns.map((col) => {
+              const width = columnWidths[col] ?? estimateQueryColumnWidth(col)
+              return (
+                <th key={col} className="col-header" style={{ width, minWidth: width }}>
+                  <span className="col-header-label">
+                    {col}
+                    {orderBy?.col === col && <span className="sort-indicator">{orderBy.dir === 'ASC' ? ' ↑' : ' ↓'}</span>}
+                  </span>
+                  <span className="col-sort-trigger" onClick={(e) => { e.stopPropagation(); onSetSortMenu(colSortMenu === col ? null : col) }}>▾</span>
+                  {colSortMenu === col && (
+                    <div className="col-sort-menu" onClick={(e) => e.stopPropagation()}>
+                      <div className="col-sort-item" onClick={() => onApplySort(col, 'ASC')}>↓<span style={{ color: '#4285f4' }}>A</span><span style={{ color: '#4285f4' }}>Z</span>&nbsp; 升序排序</div>
+                      <div className="col-sort-item" onClick={() => onApplySort(col, 'DESC')}>↓<span style={{ color: '#ea4335' }}>Z</span><span style={{ color: '#ea4335' }}>A</span>&nbsp; 降序排序</div>
+                      <div className="col-sort-item" onClick={() => onApplySort(col, null)}>↓<span style={{ color: '#ea4335' }}>⊘</span>&nbsp; 移除排序</div>
+                    </div>
+                  )}
+                  <span className="col-resize-handle" onMouseDown={(e) => handleColumnResizeStart(col, e)} />
+                </th>
+              )
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {topPad > 0 && (
+            <tr aria-hidden="true">
+              <td colSpan={columns.length + 1} style={{ height: topPad, padding: 0, border: 0 }} />
+            </tr>
+          )}
+          {visibleRows.map((item, visibleIdx) => {
+            const rowIdx = startIdx + visibleIdx
+            const isDeleted = item.type === 'existing' && deletedRows.has(item.originalIdx)
+            const isNew = item.type === 'new'
+            let rowClass = ''
+            if (selectedRows.has(rowIdx)) rowClass += ' row-selected'
+            if (isDeleted) rowClass += ' row-deleted'
+            if (isNew) rowClass += ' row-new'
+
+            return (
+              <tr
+                key={`${item.type}:${item.originalIdx}`}
+                className={rowClass.trim()}
+                style={{ height: ROW_HEIGHT }}
+                onClick={(e) => onRowClick(e, rowIdx)}
+              >
+                <td className="row-num">{rowOffset + rowIdx + 1}{isNew ? ' +' : ''}{isDeleted ? ' −' : ''}</td>
+                {columns.map((col) => {
+                  const width = columnWidths[col] ?? estimateQueryColumnWidth(col)
+                  const isEditing = editingCell?.row === rowIdx && editingCell?.col === col
+                  const rawVal = getCellValue(item, col)
+                  const { text, isNull } = formatCell(rawVal)
+                  const modified = !isNew && isCellModified(item, col)
+                  let cellClass = ''
+                  if (isNull) cellClass += ' cell-null'
+                  if (modified) cellClass += ' cell-modified'
+
+                  if (isEditing) {
+                    return (
+                      <td key={col} className={cellClass.trim()} style={{ width, minWidth: width, maxWidth: width }}>
+                        <input
+                          className="cell-edit-input"
+                          autoFocus
+                          defaultValue={text === 'NULL' ? '' : text}
+                          onBlur={(e) => {
+                            onCommitCell(item, col, e.target.value)
+                            onCancelEdit()
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                            if (e.key === 'Escape') onCancelEdit()
+                            if (e.key === 'Tab') {
+                              e.preventDefault()
+                              const ci = columns.indexOf(col)
+                              const nextCol = columns[ci + 1]
+                              if (nextCol) {
+                                ;(e.target as HTMLInputElement).blur()
+                                setTimeout(() => onStartEdit(rowIdx, nextCol), 0)
+                              } else {
+                                ;(e.target as HTMLInputElement).blur()
+                              }
+                            }
+                          }}
+                        />
+                      </td>
+                    )
+                  }
+
+                  return (
+                    <td
+                      key={col}
+                      className={cellClass.trim()}
+                      style={{ width, minWidth: width, maxWidth: width }}
+                      onDoubleClick={() => !isDeleted && onStartEdit(rowIdx, col)}
+                      onContextMenu={(e) => onCellContextMenu(e, text, col, rowIdx)}
+                    >{text}</td>
+                  )
+                })}
+              </tr>
+            )
+          })}
+          {bottomPad > 0 && (
+            <tr aria-hidden="true">
+              <td colSpan={columns.length + 1} style={{ height: bottomPad, padding: 0, border: 0 }} />
+            </tr>
+          )}
+          {rows.length === 0 && (
+            <tr><td colSpan={columns.length + 1} style={{ color: '#aaa', textAlign: 'center', padding: 20 }}>无数据</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 type QueryResultsPaneProps = {
   results: QueryTab['results']
   activeResultIndex: number
@@ -2513,37 +2769,6 @@ export default function App() {
 
   /* ── Data tab content ───────────────────────── */
 
-  /** Column resize drag handler */
-  function colResizeStart(e: React.MouseEvent) {
-    e.preventDefault()
-    e.stopPropagation()
-    const handle = e.currentTarget as HTMLElement
-    const th = handle.parentElement as HTMLElement
-    const table = th.closest('table') as HTMLElement
-    if (!table) return
-    const startX = e.clientX
-    const startW = th.offsetWidth
-    const widthUpdater = createRafUpdater<number>((width) => {
-      th.style.width = `${width}px`
-      th.style.minWidth = `${width}px`
-    })
-    function onMove(ev: MouseEvent) {
-      const w = Math.max(40, startW + ev.clientX - startX)
-      widthUpdater.schedule(w)
-    }
-    function onUp() {
-      widthUpdater.flush()
-      document.removeEventListener('mousemove', onMove)
-      document.removeEventListener('mouseup', onUp)
-      document.body.style.userSelect = ''
-      document.body.style.cursor = ''
-    }
-    document.body.style.userSelect = 'none'
-    document.body.style.cursor = 'col-resize'
-    document.addEventListener('mousemove', onMove)
-    document.addEventListener('mouseup', onUp)
-  }
-
   function renderDataTab(tab: DataTab) {
     if (tab.loading && tab.columns.length === 0) {
       return <div className="empty-state"><span className="empty-title">加载中...</span></div>
@@ -2823,12 +3048,6 @@ export default function App() {
       goToPage(1, undefined, newOrder)
     }
 
-    /** Sort indicator for column header */
-    function sortIcon(col: string) {
-      if (!orderBy || orderBy.col !== col) return null
-      return <span className="sort-indicator">{orderBy.dir === 'ASC' ? ' ↑' : ' ↓'}</span>
-    }
-
     /** Toggle filter panel */
     function toggleFilter() {
       if (!filterOpen) {
@@ -3025,13 +3244,35 @@ export default function App() {
     }
 
     // Combine original rows + new rows for rendering
-    const allRows: { data: Record<string, unknown>; type: 'existing' | 'new'; originalIdx: number }[] = []
+    const allRows: DataGridRow[] = []
     tab.rows.forEach((row, i) => {
       allRows.push({ data: row, type: 'existing', originalIdx: i })
     })
     newRows.forEach((nr, i) => {
       allRows.push({ data: nr, type: 'new', originalIdx: tab.rows.length + i })
     })
+
+    function getGridCellValue(item: DataGridRow, col: string) {
+      return item.type === 'new' ? item.data[col] : getCellValue(item.originalIdx, col)
+    }
+
+    function isGridCellModified(item: DataGridRow, col: string) {
+      return item.type === 'existing' && isCellModified(item.originalIdx, col)
+    }
+
+    function commitGridCell(item: DataGridRow, col: string, value: string) {
+      if (item.type === 'new') {
+        setNewRows(prev => {
+          const copy = [...prev]
+          const nrIdx = item.originalIdx - tab.rows.length
+          copy[nrIdx] = { ...copy[nrIdx], [col]: value === '' ? null : value }
+          return copy
+        })
+        return
+      }
+      setCellValue(item.originalIdx, col, value)
+    }
+
     /** Render a single filter rule row */
     function renderFilterRule(rule: typeof filterRules[0], isLast: boolean, groupId?: string) {
       return (
@@ -3220,110 +3461,26 @@ export default function App() {
           </div>
         )}
 
-        <div className="data-grid-wrap" onClick={() => setColSortMenu(null)}>
-          <table className="data-grid">
-            <thead>
-              <tr>
-                <th className="row-num-header">#</th>
-                {tab.columns.map(col => (
-                  <th key={col} className="col-header">
-                    <span className="col-header-label">{col}{sortIcon(col)}</span>
-                    <span className="col-sort-trigger" onClick={e => { e.stopPropagation(); setColSortMenu(colSortMenu === col ? null : col) }}>▾</span>
-                    {colSortMenu === col && (
-                      <div className="col-sort-menu" onClick={e => e.stopPropagation()}>
-                        <div className="col-sort-item" onClick={() => applySort(col, 'ASC')}>↓<span style={{color:'#4285f4'}}>A</span><span style={{color:'#4285f4'}}>Z</span>&nbsp; 升序排序</div>
-                        <div className="col-sort-item" onClick={() => applySort(col, 'DESC')}>↓<span style={{color:'#ea4335'}}>Z</span><span style={{color:'#ea4335'}}>A</span>&nbsp; 降序排序</div>
-                        <div className="col-sort-item" onClick={() => applySort(col, null)}>↓<span style={{color:'#ea4335'}}>⊘</span>&nbsp; 移除排序</div>
-                      </div>
-                    )}
-                    <span className="col-resize-handle" onMouseDown={colResizeStart} />
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {allRows.map((item, i) => {
-                const isDeleted = item.type === 'existing' && deletedRows.has(item.originalIdx)
-                const isNew = item.type === 'new'
-                let rowClass = ''
-                if (selectedRows.has(i)) rowClass += ' row-selected'
-                if (isDeleted) rowClass += ' row-deleted'
-                if (isNew) rowClass += ' row-new'
-                return (
-                  <tr
-                    key={i}
-                    className={rowClass.trim()}
-                    onClick={e => handleRowClick(e, i)}
-                  >
-                    <td className="row-num">{rowOffset + i + 1}{isNew ? ' +' : ''}{isDeleted ? ' −' : ''}</td>
-                    {tab.columns.map(col => {
-                      const isEditing = editingCell?.row === i && editingCell?.col === col
-                      const rawVal = isNew ? item.data[col] : getCellValue(item.originalIdx, col)
-                      const { text, isNull } = formatCell(rawVal)
-                      const modified = !isNew && isCellModified(item.originalIdx, col)
-                      let cellClass = ''
-                      if (isNull) cellClass += ' cell-null'
-                      if (modified) cellClass += ' cell-modified'
-
-                      if (isEditing) {
-                        return (
-                          <td key={col} className={cellClass.trim()}>
-                            <input
-                              className="cell-edit-input"
-                              autoFocus
-                              defaultValue={text === 'NULL' ? '' : text}
-                              onBlur={e => {
-                                if (isNew) {
-                                  const val = e.target.value
-                                  setNewRows(prev => {
-                                    const copy = [...prev]
-                                    const nrIdx = item.originalIdx - tab.rows.length
-                                    copy[nrIdx] = { ...copy[nrIdx], [col]: val === '' ? null : val }
-                                    return copy
-                                  })
-                                } else {
-                                  setCellValue(item.originalIdx, col, e.target.value)
-                                }
-                                setEditingCell(null)
-                              }}
-                              onKeyDown={e => {
-                                if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-                                if (e.key === 'Escape') setEditingCell(null)
-                                if (e.key === 'Tab') {
-                                  e.preventDefault()
-                                  const ci = tab.columns.indexOf(col)
-                                  const nextCol = tab.columns[ci + 1]
-                                  if (nextCol) {
-                                    ;(e.target as HTMLInputElement).blur()
-                                    setTimeout(() => setEditingCell({ row: i, col: nextCol }), 0)
-                                  } else {
-                                    ;(e.target as HTMLInputElement).blur()
-                                  }
-                                }
-                              }}
-                            />
-                          </td>
-                        )
-                      }
-
-                      return (
-                        <td
-                          key={col}
-                          className={cellClass.trim()}
-                          onDoubleClick={() => !isDeleted && setEditingCell({ row: i, col })}
-                          onContextMenu={e => cellContextMenu(e, text, col, i)}
-                        >{text}</td>
-                      )
-                    })}
-                  </tr>
-                )
-              })}
-              {allRows.length === 0 && (
-                <tr><td colSpan={tab.columns.length + 1} style={{ color: '#aaa', textAlign: 'center', padding: 20 }}>无数据</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+        <VirtualDataGrid
+          columns={tab.columns}
+          rows={allRows}
+          rowOffset={rowOffset}
+          resetScrollKey={tab.rows}
+          selectedRows={selectedRows}
+          deletedRows={deletedRows}
+          editingCell={editingCell}
+          orderBy={orderBy}
+          colSortMenu={colSortMenu}
+          onSetSortMenu={setColSortMenu}
+          onApplySort={applySort}
+          onRowClick={handleRowClick}
+          onCellContextMenu={cellContextMenu}
+          onStartEdit={(row, col) => setEditingCell({ row, col })}
+          onCommitCell={commitGridCell}
+          onCancelEdit={() => setEditingCell(null)}
+          getCellValue={getGridCellValue}
+          isCellModified={isGridCellModified}
+        />
         <div className="data-footer">
           <div className="data-action-bar">
             <button className="action-btn" onClick={addNewRow} title="添加一行">+</button>

@@ -125,6 +125,7 @@ const hiddenSchemas = new Set([
   'performance_schema',
   'sys',
 ])
+const MYSQL_POOL_IDLE_TIMEOUT_MS = 10 * 60_000
 
 export class QueryCancelledError extends Error {
   constructor() {
@@ -257,6 +258,7 @@ function isRecoverableConnectionError(error: unknown) {
   return [
     'PROTOCOL_CONNECTION_LOST',
     'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
+    'ECONNREFUSED',
     'ECONNRESET',
     'EPIPE',
     'ETIMEDOUT',
@@ -280,6 +282,16 @@ function formatConnectionError(config: ConnectionConfig, error: unknown) {
 
     if (isNoSslSupportError(error)) {
       return new Error(`${message} Disable SSL/TLS for this server and try again.`)
+    }
+
+    if (
+      config.useSSH &&
+      code === 'ECONNREFUSED' &&
+      (message.includes('127.0.0.1:') || message.includes('localhost:'))
+    ) {
+      return new Error(
+        `${message} SSH 本地隧道没有保持监听。请优先检查 SSH 主机、认证方式，或确认跳板机是否允许 TCP 转发并能访问 ${config.host}:${config.port}。`,
+      )
     }
 
     if (
@@ -382,13 +394,27 @@ export async function getPool(config: ConnectionConfig, forceRefresh = false): P
       waitForConnections: true,
       connectionLimit: 6,
       maxIdle: 6,
-      idleTimeout: 60_000,
+      idleTimeout: MYSQL_POOL_IDLE_TIMEOUT_MS,
       queueLimit: 0,
       connectTimeout: 15_000,
       enableKeepAlive: true,
       keepAliveInitialDelay: 0,
       multipleStatements: true,
     })
+
+    // Force the first connection immediately so SSH tunnel or socket failures
+    // surface here instead of later as a random localhost port error.
+    try {
+      const connection = await pool.getConnection()
+      try {
+        await connection.ping()
+      } finally {
+        connection.release()
+      }
+    } catch (error) {
+      await pool.end().catch(() => undefined)
+      throw error
+    }
 
     pools.set(fingerprint, pool)
     return pool
@@ -449,6 +475,28 @@ async function setupSSHTunnel(config: ConnectionConfig, tunnelKey: string): Prom
       sshClient.end()
     }
 
+    const probeRemoteMysql = () =>
+      new Promise<void>((resolveProbe, rejectProbe) => {
+        sshClient.forwardOut(
+          '127.0.0.1', 0,
+          config.host, config.port,
+          (err, stream) => {
+            if (err) {
+              rejectProbe(
+                new Error(
+                  `SSH 已连接到 ${config.sshHost}:${config.sshPort ?? 22}，但跳板机无法访问 MySQL ${config.host}:${config.port}: ${err.message}`,
+                ),
+              )
+              return
+            }
+
+            stream.on('error', () => undefined)
+            stream.end()
+            resolveProbe()
+          },
+        )
+      })
+
     // Build auth config
     const sshConfig: Record<string, unknown> = {
       host: config.sshHost,
@@ -492,47 +540,60 @@ async function setupSSHTunnel(config: ConnectionConfig, tunnelKey: string): Prom
     })
 
     sshClient.on('ready', () => {
-      // Create local TCP server to forward connections
-      tunnelServer = net.createServer((localSocket) => {
-        sshClient.forwardOut(
-          '127.0.0.1', 0,
-          config.host, config.port,
-          (err, stream) => {
-            if (err) {
-              localSocket.end()
-              return
+      void (async () => {
+        try {
+          await probeRemoteMysql()
+
+          // Create local TCP server to forward connections
+          tunnelServer = net.createServer((localSocket) => {
+            sshClient.forwardOut(
+              '127.0.0.1', 0,
+              config.host, config.port,
+              (err, stream) => {
+                if (err) {
+                  localSocket.destroy(
+                    new Error(
+                      `SSH 跳板机无法转发到 MySQL ${config.host}:${config.port}: ${err.message}`,
+                    ),
+                  )
+                  return
+                }
+
+                stream.on('error', () => {
+                  localSocket.destroy()
+                })
+
+                localSocket.on('error', () => {
+                  stream.destroy()
+                })
+
+                localSocket.pipe(stream).pipe(localSocket)
+              },
+            )
+          })
+
+          tunnelServer.on('error', (error) => {
+            if (!resolved) {
+              rejectOnce(new Error(`SSH 隧道启动失败: ${error.message}`))
             }
+            closeTunnel()
+          })
 
-            stream.on('error', () => {
-              localSocket.destroy()
+          tunnelServer.listen(0, '127.0.0.1', () => {
+            const addr = tunnelServer?.address()
+            const localPort = typeof addr === 'object' && addr ? addr.port : 0
+            resolved = true
+            sshTunnels.set(tunnelKey, {
+              localPort,
+              close: closeTunnel,
             })
-
-            localSocket.on('error', () => {
-              stream.destroy()
-            })
-
-            localSocket.pipe(stream).pipe(localSocket)
-          },
-        )
-      })
-
-      tunnelServer.on('error', (error) => {
-        if (!resolved) {
-          rejectOnce(new Error(`SSH 隧道启动失败: ${error.message}`))
+            resolveOnce(localPort)
+          })
+        } catch (error) {
+          rejectOnce(error instanceof Error ? error : new Error(String(error)))
+          closeTunnel()
         }
-        closeTunnel()
-      })
-
-      tunnelServer.listen(0, '127.0.0.1', () => {
-        const addr = tunnelServer?.address()
-        const localPort = typeof addr === 'object' && addr ? addr.port : 0
-        resolved = true
-        sshTunnels.set(tunnelKey, {
-          localPort,
-          close: closeTunnel,
-        })
-        resolveOnce(localPort)
-      })
+      })()
     })
 
     sshClient.on('error', (err) => {

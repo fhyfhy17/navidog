@@ -70,7 +70,13 @@ npm install
 npm run dev
 ```
 
-前端页面：http://localhost:5173 （自动代理 API 到后端 3001 端口）
+前端页面：http://localhost:5173
+
+开发模式下：
+- 前端 Vite 使用 `5173`（若被占用会顺延到下一个可用端口）
+- 后端 API 固定使用 `3002`
+
+这样可以避免和 `npx navidog` / `npm start` 默认占用的 `3001` 冲突。
 
 ### 自定义端口
 
